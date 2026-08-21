@@ -60,7 +60,7 @@ window.resolvePageDialog=confirmed=>{
   pageDialogResolve=null;
   resolve(confirmed?(pageDialogMode==="prompt"?input.value.trim():true):(pageDialogMode==="prompt"?null:false))
 };
-function steamTheme(){return{backgroundColor:"transparent",textStyle:{color:"#e1e8ed"},legend:{textStyle:{color:"#aeb9c2"}},tooltip:{backgroundColor:"#2a475e",borderColor:"#355066",textStyle:{color:"#e1e8ed"}}}}
+function steamTheme(){return{backgroundColor:"transparent",textStyle:{color:"#4f3d33"},legend:{textStyle:{color:"#806e62"}},tooltip:{backgroundColor:"#fffaf4",borderColor:"#f1d5bd",textStyle:{color:"#4f3d33"}}}}
 function disposeChart(id){const el=document.getElementById(id);if(el){const inst=echarts.getInstanceByDom(el);if(inst)inst.dispose()}}
 function initChart(id){disposeChart(id);const el=document.getElementById(id);return el?echarts.init(el):null}
 const coverCache=new Map();
@@ -83,22 +83,26 @@ let dashPeriod="week";
 async function renderDashboard(){
   const data=await API.get("/api/dashboard/stats");
   const c=document.getElementById("content");
-  c.innerHTML=`<div class="flex-between mb-20"><h2 class="page-title">仪表盘</h2>
-    <div class="tab-bar" id="dash-tabs">
-      <button class="tab-btn" data-p="today">今天</button><button class="tab-btn" data-p="yesterday">昨天</button>
-      <button class="tab-btn active" data-p="week">一周</button><button class="tab-btn" data-p="month">一个月</button>
-    </div></div>
+  c.innerHTML=`<section class="dashboard-hero">
+      <div><div class="eyebrow">DATA OVERVIEW</div><h2 class="page-title">玩家数据中心</h2><p>关注社区活跃趋势，了解大家最近都在玩什么。</p></div>
+      <div class="dashboard-live"><span></span>数据已同步</div>
+    </section>
+    <div class="dashboard-toolbar"><div><h3>社区概览</h3><p>今日实时统计</p></div>
+      <div class="tab-bar" id="dash-tabs">
+        <button class="tab-btn" data-p="today">今天</button><button class="tab-btn" data-p="yesterday">昨天</button>
+        <button class="tab-btn active" data-p="week">一周</button><button class="tab-btn" data-p="month">一个月</button>
+      </div></div>
     <div class="stats-grid">
-      <div class="stat-card"><div class="stat-value">${data.total_groups}</div><div class="stat-label">监控群聊</div></div>
-      <div class="stat-card"><div class="stat-value">${data.total_players}</div><div class="stat-label">监控玩家</div></div>
-      <div class="stat-card"><div class="stat-value">${data.today_active_players}</div><div class="stat-label">今日活跃</div></div>
-      <div class="stat-card"><div class="stat-value">${data.total_bindings}</div><div class="stat-label">QQ绑定</div></div>
+      <div class="stat-card"><span class="stat-icon mdi mdi-account-group"></span><div><div class="stat-label">监控群聊</div><div class="stat-value">${data.total_groups}</div><small>已接入社区</small></div></div>
+      <div class="stat-card"><span class="stat-icon mdi mdi-account-multiple"></span><div><div class="stat-label">监控玩家</div><div class="stat-value">${data.total_players}</div><small>Steam 玩家总数</small></div></div>
+      <div class="stat-card"><span class="stat-icon mdi mdi-controller-classic"></span><div><div class="stat-label">今日活跃</div><div class="stat-value">${data.today_active_players}</div><small>产生游玩记录</small></div></div>
+      <div class="stat-card"><span class="stat-icon mdi mdi-link-variant"></span><div><div class="stat-label">账号绑定</div><div class="stat-value">${data.total_bindings}</div><small>已关联平台账号</small></div></div>
     </div>
     <div class="charts-row">
-      <div class="card"><div class="card-title">玩家排行</div><div class="rank-img-wrapper"><img id="rank-image" style="max-width:100%;border-radius:var(--border-radius-lg)" onclick="document.getElementById('img-overlay').classList.add('show');document.getElementById('overlay-img').src=this.src"></div></div>
-      <div class="card"><div class="card-title">热门游戏</div><div id="chart-top-games" class="chart-box" style="height:480px"></div></div>
+      <div class="card feature-card"><div class="card-heading"><div><div class="card-title">玩家时长排行</div><p>看看本周期的游戏达人</p></div><span class="mdi mdi-trophy-outline"></span></div><div class="rank-img-wrapper"><img id="rank-image" style="max-width:100%;border-radius:var(--border-radius-lg)" onclick="document.getElementById('img-overlay').classList.add('show');document.getElementById('overlay-img').src=this.src"></div></div>
+      <div class="card feature-card"><div class="card-heading"><div><div class="card-title">热门游戏分布</div><p>按累计游玩时长统计</p></div><span class="mdi mdi-chart-donut"></span></div><div id="chart-top-games" class="chart-box" style="height:480px"></div></div>
     </div>
-    <div class="card"><div class="card-title">在线玩家 (${data.players?.length||0}人)</div><div id="dash-player-cards" class="flex flex-wrap gap-8"></div></div>`;
+    <div class="card players-panel"><div class="card-heading"><div><div class="card-title">玩家状态</div><p>当前监控列表，共 ${data.players?.length||0} 人</p></div><span class="status-pill">实时</span></div><div id="dash-player-cards" class="player-card-grid"></div></div>`;
   renderDashPlayerCards(data.players||[]);
   document.querySelectorAll("#dash-tabs .tab-btn").forEach(btn=>{btn.addEventListener("click",async()=>{document.querySelectorAll("#dash-tabs .tab-btn").forEach(b=>b.classList.remove("active"));btn.classList.add("active");dashPeriod=btn.dataset.p;await loadDashboardCharts()})});
   await loadDashboardCharts();
@@ -143,14 +147,14 @@ async function loadDashboardCharts(){
   const covers={};
   await Promise.all(top9.filter(g=>g.gameid).map(async g=>{covers[g.gameid]=await loadCover(g.gameid)}));
   const gc=initChart("chart-top-games");if(!gc)return;
-  const cols=["#5aa9d6","#b2d430","#e8a030","#b37cd4","#e05050","#50c8c8","#ff8c60","#60b0e0","#e0a0c0","#80d080"];
-  gc.setOption({...steamTheme(),tooltip:{trigger:"item",backgroundColor:"#1e2c38",borderColor:"#2e4254",borderWidth:1,extraCssText:"border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.5)",formatter:p=>{
+  const cols=["#f47b35","#f5aa62","#efc56b","#79ad7b","#a58ac7","#df7770","#e99c83","#7fb8b1","#d6a06f","#91b77e"];
+  gc.setOption({...steamTheme(),tooltip:{trigger:"item",backgroundColor:"#fffaf4",borderColor:"#f1d5bd",borderWidth:1,extraCssText:"border-radius:10px;box-shadow:0 8px 24px rgba(117,72,38,0.12)",formatter:p=>{
     const det=details[p.data.gameid];if(!det||!det.players)return`<b>${escapeHtml(p.name)}</b><br/>${p.value}分钟`;
     const cover=covers[p.data.gameid]||"";
     let h=`<div style="min-width:200px;max-width:260px"><b style="font-size:14px">${escapeHtml(det.name)}</b>${cover?`<img src="${safeImageUrl(cover)}" style="width:100%;max-width:240px;border-radius:6px;margin:8px 0;display:block">`:""}`;
     det.players.slice(0,5).forEach(pl=>{h+=`<div style="display:flex;justify-content:space-between;font-size:12px;margin:3px 0"><span>${escapeHtml(pl.name)}</span><span style="color:var(--accent)">${(pl.minutes/60).toFixed(1)}h</span></div>`});
     if(det.players.length>5){const om=det.players.slice(5).reduce((s,pl)=>s+pl.minutes,0);h+=`<div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted)"><span>其他${det.players.length-5}位</span><span>${(om/60).toFixed(1)}h</span></div>`}
-    h+="</div>";return h}},legend:{bottom:0,textStyle:{color:"#aeb9c2"}},series:[{type:"pie",radius:["35%","60%"],center:["50%","32%"],data:top9.map((g,i)=>({name:g.name,value:g.minutes,gameid:g.gameid,itemStyle:{color:g.name==="其他"?"#555":cols[i%cols.length]}})),label:{color:"#e1e8ed",formatter:"{d}%",fontSize:12},emphasis:{label:{fontSize:16,fontWeight:"bold"}}}]});
+    h+="</div>";return h}},legend:{bottom:0,textStyle:{color:"#806e62"}},series:[{type:"pie",radius:["35%","60%"],center:["50%","32%"],data:top9.map((g,i)=>({name:g.name,value:g.minutes,gameid:g.gameid,itemStyle:{color:g.name==="其他"?"#c9b9ae":cols[i%cols.length]}})),label:{color:"#4f3d33",formatter:"{d}%",fontSize:12},emphasis:{label:{fontSize:16,fontWeight:"bold"}}}]});
 }
 
 // ====== Gantt ======
