@@ -143,8 +143,13 @@ class WebAdminAPI:
         )
         return json_response(payload)
 
-    def invalidate_cache(self, *names):
-        self._response_cache.invalidate(*names)
+    def _invalidate_statistics_cache(self):
+        self._response_cache.invalidate(
+            "dashboard",
+            "groups",
+            "player-search",
+            "heatmap",
+        )
 
     def register_routes(self, context):
         """Register all routes used by ``pages/steam-monitor``."""
@@ -650,6 +655,7 @@ class WebAdminAPI:
             nick = str(data.get("nickname", "")).strip()
             p._bind_data[qq] = {"sid": sid, "nickname": nick or "*"}
             p._save_bind_data()
+        self._invalidate_statistics_cache()
         return json_response({"ok": True})
 
     async def _api_groups_delete(self, request):
@@ -671,6 +677,7 @@ class WebAdminAPI:
             if not groups[gid]:
                 del groups[gid]
             p._save_group_steam_ids()
+            self._invalidate_statistics_cache()
         return json_response({"ok": True})
 
     async def _api_groups_add_group(self, request):
@@ -688,6 +695,7 @@ class WebAdminAPI:
             return json_response({"ok": True, "message": "already exists"})
         groups[gid] = []
         p._save_group_steam_ids()
+        self._invalidate_statistics_cache()
         return json_response({"ok": True})
 
     async def _api_groups_delete_group(self, request):
@@ -704,6 +712,7 @@ class WebAdminAPI:
         if gid in groups:
             del groups[gid]
             p._save_group_steam_ids()
+            self._invalidate_statistics_cache()
         return json_response({"ok": True})
 
     async def _api_groups_import_batch(self, request):
@@ -773,6 +782,7 @@ class WebAdminAPI:
 
         if imported:
             p._save_group_steam_ids()
+            self._invalidate_statistics_cache()
 
         return json_response({
             "ok": True,
@@ -829,6 +839,7 @@ class WebAdminAPI:
             )
         p._bind_data[qq] = {"sid": sid, "nickname": nickname}
         p._save_bind_data()
+        self._invalidate_statistics_cache()
         return json_response({"ok": True})
 
     async def _api_bindings_delete(self, request):
@@ -841,6 +852,7 @@ class WebAdminAPI:
         if qq in p._bind_data:
             del p._bind_data[qq]
             p._save_bind_data()
+            self._invalidate_statistics_cache()
         return json_response({"ok": True})
 
     async def _api_bindings_update(self, request):
@@ -854,6 +866,7 @@ class WebAdminAPI:
         if qq in p._bind_data:
             p._bind_data[qq]["nickname"] = nickname
             p._save_bind_data()
+            self._invalidate_statistics_cache()
         return json_response({"ok": True})
 
     # ────── Push Settings ──────
