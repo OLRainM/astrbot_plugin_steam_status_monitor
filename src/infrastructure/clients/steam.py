@@ -275,10 +275,6 @@ class SteamClientMixin:
             logger.warning(f"获取 Steam 评价摘要失败: {exc} (appid={gid})")
             return None
 
-    async def fetch_game_reviews(self, appid, language="schinese"):
-        """获取 Steam 商店评价摘要（默认简体中文；language=None 表示全部语言）。"""
-        return await self._review_summary(appid, language)
-
     async def fetch_game_reviews_both(self, appid):
         """同时获取「全部语言」与「简体中文」两份评价摘要，供卡片并列显示。"""
         all_review, zh_review = await asyncio.gather(

@@ -153,12 +153,9 @@ class WebAdminAPI:
         )
         return json_response(payload)
 
-    def invalidate_cache(self, *names):
-        self._response_cache.invalidate(*names)
-
     def _invalidate_statistics_cache(self):
         """Invalidate cached responses affected by group/player mutations."""
-        self.invalidate_cache("dashboard", "groups", "heatmap", "player_search_index")
+        self._response_cache.invalidate("dashboard", "groups", "heatmap", "player_search_index")
 
     def register_routes(self, context):
         """Register all routes used by ``pages/steam-monitor``."""
@@ -349,11 +346,7 @@ class WebAdminAPI:
         font_path = None
         try:
             from ...shared.fonts import resolve_font_path
-            fp = getattr(p, "get_font_path", None)
-            if fp:
-                font_path = fp("NotoSansHans-Regular.otf")
-            if not font_path:
-                font_path = resolve_font_path("NotoSansHans-Regular.otf")
+            font_path = resolve_font_path("NotoSansHans-Regular.otf")
         except Exception:
             pass
 

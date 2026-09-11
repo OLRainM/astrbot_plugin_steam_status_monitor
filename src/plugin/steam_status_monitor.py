@@ -24,8 +24,8 @@ from ..presentation.renderers.game_start import render_game_start
 from ..presentation.renderers.game_end import render_game_end
 from ..presentation.renderers.rank import render_rank_image
 from ..presentation.renderers.game_detail import COUNTRY_LABEL, render_game_detail_image
-from ..presentation.renderers.game_start import get_font_path
 from ..domain.monitoring import MonitorStateStore, StateBackedMonitorMixin
+from ..shared.fonts import resolve_font_path
 from ..domain.ranking.push_scopes import build_rank_push_scopes
 from PIL import Image as PILImage
 import io
@@ -566,7 +566,7 @@ class SteamStatusMonitorV3(
         try:
             img_bytes = await render_game_detail_image(
                 game,
-                font_path=get_font_path("NotoSansHans-Regular.otf"),
+                font_path=resolve_font_path("NotoSansHans-Regular.otf"),
                 proxy=self.proxy,
             )
             with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
@@ -756,7 +756,7 @@ class SteamStatusMonitorV3(
         try:
             img_bytes = await render_game_detail_image(
                 card_data,
-                font_path=get_font_path("NotoSansHans-Regular.otf"),
+                font_path=resolve_font_path("NotoSansHans-Regular.otf"),
                 proxy=self.proxy,
                 itad_summary=summary,
                 region_prices=region_prices,
@@ -811,7 +811,7 @@ class SteamStatusMonitorV3(
         if not steam_ids:
             yield event.plain_result("本群未设置监控的 SteamID 列表，请先添加。"); return
         event.group_steam_ids = steam_ids
-        font_path = self.get_font_path('NotoSansHans-Regular.otf')
+        font_path = resolve_font_path('NotoSansHans-Regular.otf')
         logger.info(f"[Font] steam_list 渲染传入字体路径: {font_path}")
         # 修改：显式传递 group_id
         async for result in handle_steam_list(self, event, group_id=group_id, font_path=font_path, proxy=self.proxy):
@@ -969,7 +969,7 @@ class SteamStatusMonitorV3(
                 if resolved:
                     g["name"] = resolved
 
-        font_path = self.get_font_path("NotoSansHans-Regular.otf")
+        font_path = resolve_font_path("NotoSansHans-Regular.otf")
         img_bytes = await render_rank_image(
             self.data_dir,
             rank_data,
@@ -1141,7 +1141,7 @@ class SteamStatusMonitorV3(
                     if resolved:
                         g["name"] = resolved
 
-            font_path = self.get_font_path('NotoSansHans-Regular.otf')
+            font_path = resolve_font_path('NotoSansHans-Regular.otf')
             img_bytes = await render_rank_image(
                 self.data_dir, rank_data, period_label,
                 font_path=font_path, proxy=self.proxy,
@@ -1367,7 +1367,7 @@ class SteamStatusMonitorV3(
         if fp: avatar_frame_paths[sid] = fp
         # 渲染列表卡片（新版steam风格不展示封面；旧版卡片风格需要封面，仅在关闭新风格时预取）
         from ..presentation.renderers.steam_list import render_steam_list_image
-        font_path = self.get_font_path('NotoSansHans-Regular.otf')
+        font_path = resolve_font_path('NotoSansHans-Regular.otf')
         steam_style = self.config.get('enable_steam_style', False)
         covers = {}
         if not steam_style and gameid:
@@ -1452,7 +1452,7 @@ class SteamStatusMonitorV3(
         import random
         count = max(1, min(count, len(achievements)))
         unlocked = set(random.sample(list(achievements), count))
-        font_path = self.get_font_path('NotoSansHans-Regular.otf')
+        font_path = resolve_font_path('NotoSansHans-Regular.otf')
         # 直接测试 Pillow 渲染
         try:
             img_bytes = await self.achievement_monitor.render_achievement_image(details, unlocked, player_name=player_name, font_path=font_path)
@@ -1479,7 +1479,7 @@ class SteamStatusMonitorV3(
             logger.info(f"[测试开始游戏渲染] steamid={steamid} gameid={gameid} player_name={player_name} avatar_url={avatar_url} zh_game_name={zh_game_name} en_game_name={en_game_name}")
             superpower = self.get_today_superpower(steamid)
             print(f"[superpower] test_game_start_render superpower={superpower}")
-            font_path = self.get_font_path('NotoSansHans-Regular.otf')
+            font_path = resolve_font_path('NotoSansHans-Regular.otf')
             online_count = await self.get_game_online_count(gameid)
             img_bytes = await render_game_start(
                 self.data_dir, steamid, player_name, avatar_url, gameid, zh_game_name, api_key=self.API_KEY, superpower=superpower, sgdb_api_key=self.SGDB_API_KEY, font_path=font_path, sgdb_game_name=en_game_name, online_count=online_count, appid=gameid
@@ -1542,7 +1542,7 @@ class SteamStatusMonitorV3(
                     tip_text = "主人你还活着喵？你是不是忘了关电脑呀~"
                 else:
                     tip_text = "你已经和椅子合为一体，成为传说中的‘椅子精’了喵！"
-            font_path = self.get_font_path('NotoSansHans-Regular.otf')
+            font_path = resolve_font_path('NotoSansHans-Regular.otf')
             img_bytes = await render_game_end(
                 self.data_dir, steamid, player_name, avatar_url, gameid, zh_game_name,
                 end_time_str, tip_text, duration_h, sgdb_api_key=self.SGDB_API_KEY, font_path=font_path, sgdb_game_name=en_game_name, appid=gameid
@@ -1941,7 +1941,7 @@ class SteamStatusMonitorV3(
                         fp = await get_avatar_frame_path(self.data_dir, sid, frame_url, proxy=self.proxy)
                 if fp:
                     avatar_frame_paths[sid] = fp
-        font_path = self.get_font_path('NotoSansHans-Regular.otf')
+        font_path = resolve_font_path('NotoSansHans-Regular.otf')
         # 新版steam风格不展示封面；旧版卡片风格需要封面，仅在关闭新风格时预取
         steam_style = self.config.get('enable_steam_style', False)
         covers = {}

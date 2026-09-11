@@ -3,7 +3,6 @@ import json
 import os
 import time
 
-from ...shared.fonts import resolve_font_path
 from ...shared.logging import logger
 from ...shared.utils.notify_session import (
     build_group_notify_session,
@@ -217,19 +216,9 @@ class PersistenceMixin:
             logger.warning("已丢弃无效监控群: %s", dropped)
             self._save_group_steam_ids()
 
-    def get_font_path(self, font_name=None, bold=False):
-        """统一解析 CJK 字体路径：bundled → 数据目录 → 系统字体。"""
-        if not font_name:
-            font_name = "NotoSansHans-Regular.otf"
-        return resolve_font_path(font_name, bold=bold) or font_name
-
-    def _get_groups_file_path(self):
-        """获取 steam_groups.json 文件路径"""
-        return os.path.join(self.data_dir, "steam_groups.json")
-
     def _load_group_steam_ids(self):
         """从 steam_groups.json 加载所有群的 SteamID 列表"""
-        path = self._get_groups_file_path()
+        path = os.path.join(self.data_dir, "steam_groups.json")
         groups = {}
         if os.path.exists(path):
             try:
@@ -243,7 +232,7 @@ class PersistenceMixin:
 
     def _save_group_steam_ids(self):
         """保存所有群的 SteamID 列表到 steam_groups.json"""
-        path = self._get_groups_file_path()
+        path = os.path.join(self.data_dir, "steam_groups.json")
         groups = self.monitor_state.group_steam_ids
         try:
             with open(path, "w", encoding="utf-8") as f:

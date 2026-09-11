@@ -87,7 +87,8 @@ class SessionService:
             )
             self._store(group_id, sid, next_session)
             for event in events:
-                self._dispatch_sync(event, skip_push=False)
+                if event.kind == "closed":
+                    self._apply_closed(event, skip_push=False)
             if events:
                 self._plugin._data_dirty = True
 
@@ -111,7 +112,12 @@ class SessionService:
             for sid, games in (pending_sids or {}).items():
                 if self.get(group_id, sid) is not None:
                     continue
-                info = self._pick_pending(games)
+                info = None
+                if isinstance(games, dict):
+                    for gameid, payload in games.items():
+                        if payload and not payload.get("notified"):
+                            info = (gameid, payload)
+                            break
                 if not info:
                     continue
                 gameid, payload = info
@@ -242,19 +248,13 @@ class SessionService:
         else:
             self._sessions()[key] = session
 
-    @staticmethod
-    def _pick_pending(games):
-        if not isinstance(games, dict):
-            return None
-        for gameid, payload in games.items():
-            if payload and not payload.get("notified"):
-                return gameid, payload
-        return None
+    def _apply_closed(self, event, *, skip_push):
+        self._on_closed(event.session, skip_push=skip_push)
+        self._meta().pop(self._key(event.session.group_id, event.session.sid), None)
 
     async def _dispatch(self, event, *, player_name, current_game_name, status, skip_push):
         if event.kind == "closed":
-            self._on_closed(event.session, skip_push=skip_push)
-            self._meta().pop(self._key(event.session.group_id, event.session.sid), None)
+            self._apply_closed(event, skip_push=skip_push)
             return
         if event.kind == "started":
             key = self._key(event.session.group_id, event.session.sid)
@@ -273,11 +273,6 @@ class SessionService:
             return
         if event.kind == "fluctuation":
             self._on_resumed(event.session, player_name=player_name, skip_push=skip_push)
-
-    def _dispatch_sync(self, event, *, skip_push):
-        if event.kind == "closed":
-            self._on_closed(event.session, skip_push=skip_push)
-            self._meta().pop(self._key(event.session.group_id, event.session.sid), None)
 
     def _on_closed(self, session: PlayingSession, *, skip_push: bool):
         plugin = self._plugin

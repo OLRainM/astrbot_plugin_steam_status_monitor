@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from ...domain.monitoring import MonitorStateStore
 from ...shared.utils.notify_session import is_valid_group_id
@@ -29,9 +29,6 @@ class MonitorAdminService:
     @property
     def max_group_size(self) -> int:
         return self._plugin.max_group_size
-
-    async def resolve_steam_input(self, value: str) -> Optional[str]:
-        return await self._plugin.resolve_steam_input(value)
 
     def add_player(self, group_id: str, steam_id: str) -> GroupMutationResult:
         if not is_valid_group_id(group_id):
