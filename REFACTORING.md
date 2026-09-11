@@ -335,4 +335,3 @@ def apply(
 
 - **方案设计**：`docs/session-lifecycle-refactor.md` - 显式状态 vs 隐式状态方案对比、状态机设计、不变量规则
 - **审计报告**：`docs/session-lifecycle-refactor-audit.md` - 原有问题分析、双路径竞争时序
-- **长期记忆**：`.codebuddy/memory/MEMORY.md` - 重构决策和约定
