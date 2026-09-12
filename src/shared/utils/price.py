@@ -113,7 +113,7 @@ def summary_to_currency(summary, target="CNY", rates=None):
         return out
     table = rates or RATES
     if currency in table and target in table:
-        for field in ("current_price", "current_regular", "history_low", "lowest"):
+        for field in ("current_price", "current_regular", "history_low", "lowest", "steam_low", "cdk_amount"):
             if out.get(field) is not None:
                 out[field] = convert(out[field], currency, target, table)
         out["currency"] = target

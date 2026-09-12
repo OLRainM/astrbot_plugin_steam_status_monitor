@@ -94,6 +94,7 @@ class PriceQueryService:
                         )
                         summary = fallback_summary
                         break
+            summary = summary_to_currency(summary, currency)
         region_codes = [region]
         if include_itad and compare_region and compare_region != "NONE" and compare_region != region:
             region_codes.append(compare_region)
