@@ -2,8 +2,6 @@ from astrbot.api.star import Star, Context
 from ..shared.logging import logger
 from ..shared.network import httpx_client_kwargs, requests_verify
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.event import MessageChain
-from astrbot.api.message_components import Plain, Image  # 确保已导入 Image
 import base64
 import time
 import httpx
@@ -34,7 +32,6 @@ from ..presentation.renderers.game_end import render_game_end
 from ..presentation.renderers.game_detail import render_game_detail_image
 from ..domain.monitoring import MonitorStateStore, StateBackedMonitorMixin, should_skip_game
 from ..shared.fonts import resolve_font_path
-from ..domain.ranking.push_scopes import build_rank_push_scopes
 from PIL import Image as PILImage
 import io
 from datetime import date
@@ -49,7 +46,7 @@ from ..infrastructure.clients.steam import SteamClientMixin
 from ..application.services.qq_menu_management import QQMenuManagementMixin
 from ..shared.paths import ABILITIES_PATH
 from ..shared.utils.price import extract_price_query, extract_steam_appid
-from ..shared.utils.notify_session import is_sendable_group_session, is_valid_group_id
+from ..shared.utils.notify_session import is_valid_group_id
 from .runtime_config import apply_hot_update, apply_runtime_config
 
 
@@ -276,70 +273,16 @@ class SteamStatusMonitorV3(
             if sid not in seen:
                 seen.add(sid)
                 steamid_list.append(sid)
-        admin = MonitorAdminService(self)
-        added = []
-        pushed = []
-        already = []
-        already_pushed = []
-        binding_updated = []
-        pushed_primary_groups = {}
-        limit = self.max_group_size
-        for sid in steamid_list:
-            result = admin.add_player(group_id, sid)
-            if result.message == "already exists":
-                already.append(sid)
-                if bind_qq or bind_nickname:
-                    binding_updated.append(sid)
-                continue
-            if result.message == "already push group":
-                already_pushed.append(sid)
-                pushed_primary_groups[sid] = admin.primary_group_of(sid)
-                continue
-            if result.message == "added as push group":
-                pushed.append(sid)
-                pushed_primary_groups[sid] = admin.primary_group_of(sid)
-                continue
-            if result.message == "added as primary monitor":
-                added.append(sid)
-                continue
-            if "group limit reached" in result.message:
-                break
-        if steamid_list and (bind_qq or bind_nickname):
-            for sid in steamid_list:
-                admin.bind_player(sid, qq=bind_qq, nickname=bind_nickname)
-            logger.info(f"[绑定] {'QQ'+str(bind_qq) if bind_qq else '备注'} -> SteamID {steamid_list[-1]}，备注={bind_nickname or '无'}")
-        msg = ""
-        if added:
-            msg += f"已为本群添加SteamID: {', '.join(added)}\n"
-        if pushed:
-            push_details = []
-            for sid in pushed:
-                primary_group = pushed_primary_groups.get(sid)
-                suffix = f"（主监控群：{primary_group}）" if primary_group else ""
-                push_details.append(f"{sid}{suffix}")
-            msg += (
-                "以下SteamID已被其他群监控，当前群不会重复监控，已自动设置为分发路由（push_group）："
-                f"{', '.join(push_details)}\n"
-            )
-        if binding_updated:
-            msg += f"以下SteamID已在本群监控，备注/绑定已更新：{', '.join(binding_updated)}\n"
-        already_plain = [sid for sid in already if sid not in binding_updated]
-        if already_plain:
-            msg += f"以下SteamID已经在本群监控，无需重复添加：{', '.join(already_plain)}\n"
-        if already_pushed:
-            push_details = []
-            for sid in already_pushed:
-                primary_group = pushed_primary_groups.get(sid)
-                suffix = f"（主监控群：{primary_group}）" if primary_group else ""
-                push_details.append(f"{sid}{suffix}")
-            msg += f"以下SteamID已经是本群的分发路由（push_group），无需重复添加：{', '.join(push_details)}\n"
-        unhandled = len(steamid_list) - len(added) - len(pushed) - len(already) - len(already_pushed)
-        if unhandled:
-            msg += f"本群监控组人数已达上限（{limit}人），部分ID未添加。\n"
-        if added and self.monitor_control.ensure_running(group_id, notify_session=event.unified_msg_origin):
+        result = MonitorAdminService(self).add_players(
+            group_id,
+            steamid_list,
+            bind_qq=bind_qq,
+            bind_nickname=bind_nickname,
+            notify_session=event.unified_msg_origin,
+        )
+        if result.started:
             self._record_platform_id(event)
-            msg += "监控已自动启动。\n"
-        yield event.plain_result(msg.strip() if msg else "未添加任何SteamID。")
+        yield event.plain_result(result.message)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("steam delid")
@@ -609,99 +552,10 @@ class SteamStatusMonitorV3(
         self._save_persistent_data(force=True)  # 清空后保存
         yield event.plain_result("Steam状态监控插件已重置，所有状态已清空。")
 
-    async def _render_daily_rank_file(self, rank_data):
-        """补齐排行榜展示信息并渲染为临时图片。"""
-        await self.rank_view.enrich(rank_data, days=1, base_day_offset=-1)
-        return await self.rank_view.render_file(rank_data, "昨日")
-
     async def _daily_rank_push(self, test_mode=False):
         """推送昨日榜单；默认按目标群独立聚合，显式全局模式才共享总榜。"""
-        use_global_rank = getattr(self, "rank_push_all", False)
-        scopes = build_rank_push_scopes(
-            getattr(self, "rank_push_groups", []),
-            use_global_rank=use_global_rank,
-        )
-        if not scopes:
-            logger.warning(
-                "[排行榜] 没有目标群可推送"
-                "（请先使用 /steam rank_on 或 /steam rank_on all 开启推送）"
-            )
-            return
+        await self.rank_view.push_daily()
 
-        rendered_files = {}
-        try:
-            for target_group_id, data_group_id in scopes:
-                render_key = (
-                    ("global", None)
-                    if data_group_id is None
-                    else ("group", data_group_id)
-                )
-                if render_key not in rendered_files:
-                    rank_data = self._get_rank_data(
-                        days=1,
-                        group_id=data_group_id,
-                        base_day_offset=-1,
-                    )
-                    if not rank_data:
-                        scope_label = (
-                            "全部群"
-                            if data_group_id is None
-                            else f"群 {data_group_id}"
-                        )
-                        logger.info(
-                            f"[排行榜] {scope_label}昨日无游玩记录，跳过推送"
-                        )
-                        rendered_files[render_key] = None
-                    else:
-                        try:
-                            rendered_files[render_key] = (
-                                await self._render_daily_rank_file(rank_data)
-                            )
-                        except Exception as e:
-                            logger.error(
-                                f"[排行榜] 渲染群 {data_group_id or '全局'} "
-                                f"昨日榜单失败: {e}"
-                            )
-                            rendered_files[render_key] = None
-
-                tmp_path = rendered_files[render_key]
-                if not tmp_path:
-                    continue
-                try:
-                    session = getattr(self, "notify_sessions", {}).get(
-                        target_group_id
-                    )
-                    if not is_sendable_group_session(session):
-                        logger.warning(
-                            f"[排行榜] 群 {target_group_id} 未找到有效推送会话，跳过"
-                        )
-                        continue
-                    await self.context.send_message(
-                        session,
-                        MessageChain([
-                            Plain("📊 昨日游戏时长排行榜来啦！\n"),
-                            Image.fromFileSystem(tmp_path),
-                        ]),
-                    )
-                    logger.info(
-                        f"[排行榜] 已推送昨日排行榜到群 {target_group_id}"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[排行榜] 推送群 {target_group_id} 失败: {e}"
-                    )
-        except Exception as e:
-            logger.error(f"[排行榜] 每日推送异常: {e}")
-        finally:
-            for tmp_path in {
-                path for path in rendered_files.values() if path
-            }:
-                try:
-                    os.unlink(tmp_path)
-                except OSError as e:
-                    logger.warning(
-                        f"[排行榜] 清理临时图片失败 {tmp_path}: {e}"
-                    )
     async def _render_and_send_rank(self, event, group_id, days, period_label, is_all=False):
         """生成排行榜图片并发送"""
         try:
@@ -739,53 +593,10 @@ class SteamStatusMonitorV3(
     @filter.command("steam rank_on")
     async def steam_rank_on(self, event: AstrMessageEvent, param: str = ""):
         '''每日排行榜推送管理；参数: all=全局排行, list=查看状态, test=即刻推送, del [群号]=删除推送'''
-        param = param.strip().lower()
-        if param == "list":
-            is_all = getattr(self, 'rank_push_all', False)
-            groups = list(self.rank_push_groups)
-            if groups:
-                mode = '全局' if is_all else '分群'
-                yield event.plain_result(f"当前排行榜推送模式：{mode}排行，推送群：{', '.join(groups)}")
-            else:
-                yield event.plain_result("当前未开启任何排行榜推送。使用 /steam rank_on 或 /steam rank_on all 开启。")
-            return
-        if param == "test":
-            yield event.plain_result("正在生成昨日排行榜，稍等...")
+        result = self.rank_view.configure_push(param, event.get_group_id() or "default")
+        yield event.plain_result(result.message)
+        if result.should_push:
             await self._daily_rank_push(test_mode=True)
-            return
-        if param.startswith("del"):
-            parts = param.split()
-            if len(parts) >= 2:
-                target = parts[1]
-            else:
-                target = event.get_group_id() or "default"
-            if target in self.rank_push_groups:
-                self.rank_push_groups.remove(target)
-                self._save_rank_push_groups()
-                yield event.plain_result(f"已关闭群 {target} 的每日排行榜推送。")
-            else:
-                yield event.plain_result(f"群 {target} 未在推送列表中。")
-            return
-        if param == "all":
-            self.rank_push_all = True
-            group_id = event.get_group_id() or "default"
-            if not is_valid_group_id(group_id):
-                yield event.plain_result("请在群聊中开启排行榜推送。")
-                return
-            if group_id not in self.rank_push_groups:
-                self.rank_push_groups.append(group_id)
-            self._save_rank_push_groups()
-            yield event.plain_result("已开启每日排行榜自动推送（全局排行）")
-        else:
-            self.rank_push_all = False
-            group_id = event.get_group_id() or "default"
-            if not is_valid_group_id(group_id):
-                yield event.plain_result("请在群聊中开启排行榜推送。")
-                return
-            if group_id not in self.rank_push_groups:
-                self.rank_push_groups.append(group_id)
-                self._save_rank_push_groups()
-            yield event.plain_result(f"已开启本群每日排行榜自动推送。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("steam qq菜单同步")

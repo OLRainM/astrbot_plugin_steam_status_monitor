@@ -1,9 +1,14 @@
+import os
 import tempfile
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+from ...domain.ranking.push_scopes import build_rank_push_scopes
 from ...presentation.renderers.game_start import get_avatar_frame_path, get_avatar_frame_url
 from ...presentation.renderers.rank import render_rank_image
 from ...shared.fonts import resolve_font_path
+from ...shared.logging import logger
+from ...shared.utils.notify_session import is_sendable_group_session, is_valid_group_id
 
 
 def parse_rank_period(period: str = "") -> Tuple[int, str]:
@@ -141,3 +146,120 @@ class RankViewService:
         if not tmp_path:
             raise RuntimeError("渲染图片失败")
         return tmp_path
+
+    def configure_push(self, param: str, group_id: Optional[str] = None) -> "RankPushConfigResult":
+        plugin = self._plugin
+        action = (param or "").strip().lower()
+        groups = list(getattr(plugin, "rank_push_groups", []) or [])
+        if action == "list":
+            if groups:
+                mode = "全局" if getattr(plugin, "rank_push_all", False) else "分群"
+                return RankPushConfigResult(
+                    f"当前排行榜推送模式：{mode}排行，推送群：{', '.join(groups)}"
+                )
+            return RankPushConfigResult(
+                "当前未开启任何排行榜推送。使用 /steam rank_on 或 /steam rank_on all 开启。"
+            )
+        if action == "test":
+            return RankPushConfigResult("正在生成昨日排行榜，稍等...", should_push=True)
+        if action.startswith("del"):
+            parts = action.split()
+            target = parts[1] if len(parts) >= 2 else (group_id or "default")
+            if target in plugin.rank_push_groups:
+                plugin.rank_push_groups.remove(target)
+                plugin._save_rank_push_groups()
+                return RankPushConfigResult(f"已关闭群 {target} 的每日排行榜推送。")
+            return RankPushConfigResult(f"群 {target} 未在推送列表中。")
+        if not is_valid_group_id(group_id):
+            return RankPushConfigResult("请在群聊中开启排行榜推送。")
+        plugin.rank_push_all = action == "all"
+        if group_id not in plugin.rank_push_groups:
+            plugin.rank_push_groups.append(group_id)
+        plugin._save_rank_push_groups()
+        if plugin.rank_push_all:
+            return RankPushConfigResult("已开启每日排行榜自动推送（全局排行）")
+        return RankPushConfigResult("已开启本群每日排行榜自动推送。")
+
+    async def push_daily(self) -> None:
+        plugin = self._plugin
+        scopes = build_rank_push_scopes(
+            getattr(plugin, "rank_push_groups", []),
+            use_global_rank=getattr(plugin, "rank_push_all", False),
+        )
+        if not scopes:
+            logger.warning(
+                "[排行榜] 没有目标群可推送"
+                "（请先使用 /steam rank_on 或 /steam rank_on all 开启推送）"
+            )
+            return
+
+        rendered_files = {}
+        try:
+            for target_group_id, data_group_id in scopes:
+                render_key = (
+                    ("global", None)
+                    if data_group_id is None
+                    else ("group", data_group_id)
+                )
+                if render_key not in rendered_files:
+                    try:
+                        tmp_path = await self.render_aggregated(
+                            days=1,
+                            period_label="昨日",
+                            group_id=data_group_id,
+                            base_day_offset=-1,
+                        )
+                        if not tmp_path:
+                            scope_label = (
+                                "全部群"
+                                if data_group_id is None
+                                else f"群 {data_group_id}"
+                            )
+                            logger.info(f"[排行榜] {scope_label}昨日无游玩记录，跳过推送")
+                        rendered_files[render_key] = tmp_path
+                    except Exception as exc:
+                        logger.error(
+                            f"[排行榜] 渲染群 {data_group_id or '全局'} 昨日榜单失败: {exc}"
+                        )
+                        rendered_files[render_key] = None
+
+                tmp_path = rendered_files[render_key]
+                if not tmp_path:
+                    continue
+                try:
+                    session = getattr(plugin, "notify_sessions", {}).get(target_group_id)
+                    if not is_sendable_group_session(session):
+                        logger.warning(
+                            f"[排行榜] 群 {target_group_id} 未找到有效推送会话，跳过"
+                        )
+                        continue
+                    await self.send_rank_image(session, tmp_path)
+                    logger.info(f"[排行榜] 已推送昨日排行榜到群 {target_group_id}")
+                except Exception as exc:
+                    logger.error(f"[排行榜] 推送群 {target_group_id} 失败: {exc}")
+        except Exception as exc:
+            logger.error(f"[排行榜] 每日推送异常: {exc}")
+        finally:
+            for tmp_path in {path for path in rendered_files.values() if path}:
+                try:
+                    os.unlink(tmp_path)
+                except OSError as exc:
+                    logger.warning(f"[排行榜] 清理临时图片失败 {tmp_path}: {exc}")
+
+    async def send_rank_image(self, session: str, tmp_path: str) -> None:
+        from astrbot.api.event import MessageChain
+        from astrbot.api.message_components import Image, Plain
+
+        await self._plugin.context.send_message(
+            session,
+            MessageChain([
+                Plain("📊 昨日游戏时长排行榜来啦！\n"),
+                Image.fromFileSystem(tmp_path),
+            ]),
+        )
+
+
+@dataclass(frozen=True)
+class RankPushConfigResult:
+    message: str
+    should_push: bool = False

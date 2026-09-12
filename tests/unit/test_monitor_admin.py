@@ -37,6 +37,28 @@ class PluginStub:
         return None
 
     @property
+    def monitor_control(self):
+        class _Control:
+            def __init__(self, plugin):
+                self._plugin = plugin
+                plugin.running_groups = getattr(plugin, "running_groups", set())
+                plugin.group_monitor_enabled = getattr(plugin, "group_monitor_enabled", {})
+                plugin.notify_sessions = getattr(plugin, "notify_sessions", {})
+
+            def ensure_running(self, group_id, notify_session=None):
+                if group_id in self._plugin.running_groups:
+                    return False
+                self._plugin.running_groups.add(group_id)
+                self._plugin.group_monitor_enabled[group_id] = True
+                if notify_session:
+                    self._plugin.notify_sessions[group_id] = notify_session
+                if group_id not in self._plugin.monitor_state.group_last_states:
+                    self._plugin.monitor_state.group_last_states[group_id] = {}
+                return True
+
+        return _Control(self)
+
+    @property
     def session_service(self):
         class _Stub:
             def discard_player(self, steam_id):
@@ -140,6 +162,44 @@ def test_remove_player_from_push_group_keeps_primary_monitor():
     assert result.message == "removed push route"
     assert plugin.group_steam_ids == {"111": [sid], "222": []}
     assert plugin.push_groups[sid] == ["333"]
+
+
+def test_add_players_reports_primary_push_and_existing():
+    sid = "76561198000000001"
+    plugin = PluginStub({"111": [sid], "222": []})
+    service = MonitorAdminService(plugin)
+
+    result = service.add_players(
+        "222",
+        [sid, "76561198000000002"],
+        bind_qq="10001",
+        bind_nickname="猫",
+        notify_session="qq:GroupMessage:0_222",
+    )
+
+    assert result.added == ["76561198000000002"]
+    assert result.started is True
+    assert "已为本群添加SteamID: 76561198000000002" in result.message
+    assert "已自动设置为分发路由" in result.message
+    assert "主监控群：111" in result.message
+    assert "监控已自动启动" in result.message
+    assert plugin.push_groups[sid] == ["222"]
+    assert plugin.group_steam_ids["222"] == ["76561198000000002"]
+    assert plugin._bind_data["10001"] == {"sid": "76561198000000002", "nickname": "猫"}
+    assert plugin.running_groups == {"222"}
+    assert plugin.notify_sessions["222"] == "qq:GroupMessage:0_222"
+
+
+def test_add_players_does_not_restart_running_group():
+    plugin = PluginStub({"111": []})
+    plugin.running_groups = {"111"}
+    service = MonitorAdminService(plugin)
+
+    result = service.add_players("111", ["76561198000000001"])
+
+    assert result.added == ["76561198000000001"]
+    assert result.started is False
+    assert "监控已自动启动" not in result.message
 
 
 def test_bind_player_writes_qq_and_remark_records():

@@ -1,13 +1,21 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from ...domain.monitoring import MonitorStateStore
+from ...shared.logging import logger
 from ...shared.utils.notify_session import is_valid_group_id
 
 
 @dataclass(frozen=True)
 class GroupMutationResult:
     changed: bool
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class AddPlayersResult:
+    added: List[str] = field(default_factory=list)
+    started: bool = False
     message: str = ""
 
 
@@ -64,6 +72,86 @@ class MonitorAdminService:
         steam_ids.append(steam_id)
         self._plugin._save_group_steam_ids()
         return GroupMutationResult(True, "added as primary monitor")
+
+    def add_players(
+        self,
+        group_id: str,
+        steam_ids: List[str],
+        *,
+        bind_qq: Optional[str] = None,
+        bind_nickname: Optional[str] = None,
+        notify_session: Optional[str] = None,
+    ) -> AddPlayersResult:
+        added = []
+        pushed = []
+        already = []
+        already_pushed = []
+        binding_updated = []
+        pushed_primary_groups = {}
+        limit = self.max_group_size
+        for sid in steam_ids:
+            result = self.add_player(group_id, sid)
+            if result.message == "already exists":
+                already.append(sid)
+                if bind_qq or bind_nickname:
+                    binding_updated.append(sid)
+                continue
+            if result.message == "already push group":
+                already_pushed.append(sid)
+                pushed_primary_groups[sid] = self.primary_group_of(sid)
+                continue
+            if result.message == "added as push group":
+                pushed.append(sid)
+                pushed_primary_groups[sid] = self.primary_group_of(sid)
+                continue
+            if result.message == "added as primary monitor":
+                added.append(sid)
+                continue
+            if "group limit reached" in result.message:
+                break
+        if steam_ids and (bind_qq or bind_nickname):
+            for sid in steam_ids:
+                self.bind_player(sid, qq=bind_qq, nickname=bind_nickname)
+            logger.info(
+                f"[绑定] {'QQ'+str(bind_qq) if bind_qq else '备注'} -> SteamID {steam_ids[-1]}，备注={bind_nickname or '无'}"
+            )
+        msg = ""
+        if added:
+            msg += f"已为本群添加SteamID: {', '.join(added)}\n"
+        if pushed:
+            push_details = []
+            for sid in pushed:
+                primary_group = pushed_primary_groups.get(sid)
+                suffix = f"（主监控群：{primary_group}）" if primary_group else ""
+                push_details.append(f"{sid}{suffix}")
+            msg += (
+                "以下SteamID已被其他群监控，当前群不会重复监控，已自动设置为分发路由（push_group）："
+                f"{', '.join(push_details)}\n"
+            )
+        if binding_updated:
+            msg += f"以下SteamID已在本群监控，备注/绑定已更新：{', '.join(binding_updated)}\n"
+        already_plain = [sid for sid in already if sid not in binding_updated]
+        if already_plain:
+            msg += f"以下SteamID已经在本群监控，无需重复添加：{', '.join(already_plain)}\n"
+        if already_pushed:
+            push_details = []
+            for sid in already_pushed:
+                primary_group = pushed_primary_groups.get(sid)
+                suffix = f"（主监控群：{primary_group}）" if primary_group else ""
+                push_details.append(f"{sid}{suffix}")
+            msg += f"以下SteamID已经是本群的分发路由（push_group），无需重复添加：{', '.join(push_details)}\n"
+        unhandled = len(steam_ids) - len(added) - len(pushed) - len(already) - len(already_pushed)
+        if unhandled:
+            msg += f"本群监控组人数已达上限（{limit}人），部分ID未添加。\n"
+        started = False
+        if added and self._plugin.monitor_control.ensure_running(group_id, notify_session=notify_session):
+            started = True
+            msg += "监控已自动启动。\n"
+        return AddPlayersResult(
+            added=added,
+            started=started,
+            message=msg.strip() if msg else "未添加任何SteamID。",
+        )
 
     def primary_group_of(self, steam_id: str) -> Optional[str]:
         return next(
