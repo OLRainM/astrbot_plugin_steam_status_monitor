@@ -1,10 +1,10 @@
 # 价格查询依赖与排行榜状态持有
 
-- 状态：草案，未落地
+- 状态：已落地（`PriceQueryService` / `RankingService` 持有权按本文执行；推送范围后由 `RankViewService` 承接）
 - 日期：2026-09-12
-- 对照：`docs/design/command-layer-split.md`、`docs/adr/adr-inline-passthrough-helpers.md`
+- 对照：`docs/design/command-layer-split.md`、`docs/adr/adr-command-layer-split.md`、`docs/adr/adr-inline-passthrough-helpers.md`
 
-本文回答三件事：价格链为什么显得复杂、`resolve_steam_input` 实际被谁调用、`play_records` / `_recorded_quit_cache` 该由谁持有。
+本文回答三件事：价格链为什么显得复杂、`resolve_steam_input` 实际被谁调用、`play_records` / `_recorded_quit_cache` 该由谁持有。决策已随命令层拆分落地；下文保留拆分前路径作为对照。
 
 ## 1. `resolve_steam_input` 不是价格链，也不是数十处调用
 

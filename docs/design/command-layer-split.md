@@ -3,7 +3,7 @@
 - 状态：第 1–4 步已落地
 - 日期：2026-09-12
 - 范围：`src/plugin/steam_status_monitor.py` 的命令面瘦身；不改会话状态机、轮询、Steam API 语义
-- 对照：`REFACTORING.md` 第 5 节「明确未拆分的内容」；`docs/adr/adr-inline-passthrough-helpers.md`
+- 对照：`REFACTORING.md` 第 5 节「明确不再继续拆的内容」、第 10 节复盘；`docs/adr/adr-inline-passthrough-helpers.md`；落地决策见 `docs/adr/adr-command-layer-split.md`
 
 本文回应「把 18 条链路收到 `presentation/commands/`，插件主体压到 100–150 行」的设计。结论：**方向对，粒度不够，行数目标不现实。** 先拆应用服务，再拆命令胶水；命令文件只做 AstrBot 适配。
 
