@@ -44,6 +44,11 @@ class ModularStructureTests(unittest.TestCase):
             "src/domain/monitoring/game_filter.py",
             "src/domain/monitoring/session.py",
             "src/domain/ranking/push_scopes.py",
+            "src/presentation/commands/__init__.py",
+            "src/presentation/commands/monitor.py",
+            "src/presentation/commands/store.py",
+            "src/presentation/commands/rank.py",
+            "src/presentation/commands/ops.py",
             "src/presentation/web/admin_api.py",
             "src/presentation/renderers/game_start.py",
             "src/shared/paths.py",
@@ -123,6 +128,17 @@ class ModularStructureTests(unittest.TestCase):
         ]
         self.assertEqual(1, method_names.count("steam_push_group"))
         self.assertEqual(1, method_names.count("steam_delpush_group"))
+
+    def test_command_modules_do_not_own_core_rules(self):
+        commands_dir = PROJECT_ROOT / "src/presentation/commands"
+        forbidden = ("play_records[", "ITAD_CLIENT", "httpx")
+        hits = []
+        for path in commands_dir.glob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            for token in forbidden:
+                if token in text:
+                    hits.append(f"{path.name}: {token}")
+        self.assertEqual([], hits)
 
 
 if __name__ == "__main__":

@@ -697,7 +697,7 @@ class WebAdminAPI:
         gid = str(data.get("group_id", "")).strip()
         if not gid:
             return json_response({"error": "invalid group_id"}, status_code=400)
-        if self.admin.remove_group(gid):
+        if self.admin.remove_group(gid).changed:
             self._invalidate_statistics_cache()
         return json_response({"ok": True})
 

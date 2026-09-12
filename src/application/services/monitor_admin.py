@@ -267,17 +267,54 @@ class MonitorAdminService:
         self._plugin._save_group_steam_ids()
         return GroupMutationResult(True)
 
-    def remove_group(self, group_id: str) -> bool:
+    def add_push_route(self, group_id: str, steam_id: str) -> GroupMutationResult:
+        if not str(steam_id).isdigit() or len(str(steam_id)) != 17:
+            return GroupMutationResult(False, "SteamID无效（需为64位数字串，17位）")
+        if self.primary_group_of(steam_id) is None:
+            return GroupMutationResult(False, "未找到已轮询该SteamID的主群，请先在任一群添加并开启监控。")
+        push_groups = getattr(self._plugin, "push_groups", None)
+        if push_groups is None:
+            push_groups = self._plugin.push_groups = {}
+        targets = push_groups.setdefault(steam_id, [])
+        if group_id in targets:
+            return GroupMutationResult(False, "本群已在该SteamID的推送组中。")
+        targets.append(group_id)
+        self._plugin._save_push_groups()
+        return GroupMutationResult(True, f"本群已加入SteamID {steam_id} 的联动推送组。")
+
+    def remove_push_route(
+        self,
+        group_id: str,
+        steam_id: str,
+        *,
+        explicit_target: bool = False,
+    ) -> GroupMutationResult:
+        if not str(steam_id).isdigit() or len(str(steam_id)) != 17:
+            return GroupMutationResult(False, "SteamID无效（需为64位数字串，17位）")
+        push_groups = getattr(self._plugin, "push_groups", {}) or {}
+        targets = push_groups.get(steam_id, [])
+        if group_id not in targets:
+            return GroupMutationResult(False, f"群 {group_id} 未在 SteamID {steam_id} 的推送组中。")
+        targets.remove(group_id)
+        if not targets:
+            push_groups.pop(steam_id, None)
+        self._plugin._save_push_groups()
+        if explicit_target:
+            return GroupMutationResult(True, f"已从 SteamID {steam_id} 的联动推送组中移除群 {group_id}。")
+        return GroupMutationResult(True, f"本群已从 SteamID {steam_id} 的联动推送组移除。")
+
+    def remove_group(self, group_id: str) -> GroupMutationResult:
+        plugin = self._plugin
         has_primary = group_id in self.groups
         routed_sids = [
             sid
-            for sid, targets in (getattr(self._plugin, "push_groups", {}) or {}).items()
+            for sid, targets in (getattr(plugin, "push_groups", {}) or {}).items()
             if str(group_id) in {str(target) for target in targets}
         ]
         if not has_primary and not routed_sids:
-            return False
+            return GroupMutationResult(False, f"群聊 {group_id} 未绑定任何SteamID，无需清理。")
 
-        push_groups = getattr(self._plugin, "push_groups", {}) or {}
+        push_groups = getattr(plugin, "push_groups", {}) or {}
         for sid in list(self.groups.get(group_id, [])):
             push_groups.pop(sid, None)
         for sid in routed_sids:
@@ -291,13 +328,63 @@ class MonitorAdminService:
         self._state.group_last_states.pop(group_id, None)
         self._state.group_last_quit_times.pop(group_id, None)
         self._state.group_pending_logs.pop(group_id, None)
-        self._plugin.session_service.discard_group(group_id)
+        plugin.session_service.discard_group(group_id)
         self._state.group_recent_games.pop(group_id, None)
         self._state.next_poll_time.pop(group_id, None)
-        self._plugin._save_group_steam_ids()
-        self._plugin._save_push_groups()
-        self._plugin._save_persistent_data(force=True)
-        return True
+        getattr(plugin, "running_groups", set()).discard(group_id)
+        getattr(plugin, "group_monitor_enabled", {}).pop(group_id, None)
+        getattr(plugin, "group_achievement_enabled", {}).pop(group_id, None)
+        getattr(plugin, "notify_sessions", {}).pop(group_id, None)
+        tasks = getattr(plugin, "achievement_poll_tasks", {})
+        for key in [item for item in list(tasks.keys()) if item[0] == group_id]:
+            task = tasks.pop(key, None)
+            if task:
+                task.cancel()
+        snapshots = getattr(plugin, "achievement_snapshots", {})
+        for key in [item for item in list(snapshots.keys()) if item[0] == group_id]:
+            snapshots.pop(key, None)
+        plugin._save_group_steam_ids()
+        plugin._save_push_groups()
+        plugin._save_notify_session()
+        plugin._save_group_switches()
+        plugin._save_persistent_data(force=True)
+        if hasattr(getattr(plugin, "config", None), "save_config"):
+            plugin.config.save_config()
+        return GroupMutationResult(True, f"已删除群聊 {group_id} 的所有SteamID和分发路由，相关状态数据已清空。")
+
+    def clear_all_ids(self) -> GroupMutationResult:
+        plugin = self._plugin
+        for task in list(getattr(plugin, "achievement_poll_tasks", {}).values()):
+            if task:
+                task.cancel()
+        getattr(plugin, "achievement_poll_tasks", {}).clear()
+        getattr(plugin, "achievement_snapshots", {}).clear()
+        getattr(plugin, "achievement_fail_count", {}).clear()
+        plugin.group_steam_ids.clear()
+        getattr(plugin, "push_groups", {}).clear()
+        getattr(plugin, "running_groups", set()).clear()
+        getattr(plugin, "group_monitor_enabled", {}).clear()
+        getattr(plugin, "group_achievement_enabled", {}).clear()
+        plugin._save_group_switches()
+        plugin.next_poll_time.clear()
+        plugin.group_last_states.clear()
+        plugin.group_last_quit_times.clear()
+        plugin.group_pending_logs.clear()
+        plugin.playing_sessions.clear()
+        getattr(plugin, "_session_meta", {}).clear()
+        plugin.group_recent_games.clear()
+        plugin._pending_end_notifications.clear()
+        getattr(plugin, "notify_sessions", {}).clear()
+        plugin._save_group_steam_ids()
+        plugin._save_push_groups()
+        plugin._save_notify_session()
+        plugin._save_persistent_data(force=True)
+        config = getattr(plugin, "config", None)
+        if isinstance(config, dict) or hasattr(config, "__setitem__"):
+            config["group_steam_ids"] = plugin.group_steam_ids
+        if hasattr(config, "save_config"):
+            config.save_config()
+        return GroupMutationResult(True, "已删除所有群聊的所有SteamID，相关状态数据已清空。")
 
     def list_group_players(self, group_id: str) -> List[Dict[str, Any]]:
         direct_ids = [str(sid) for sid in self.groups.get(group_id, [])]
