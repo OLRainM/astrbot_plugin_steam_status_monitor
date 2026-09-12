@@ -10,6 +10,7 @@ from PIL import Image as PILImage
 
 from ...presentation.renderers.game_end import render_game_end
 from ...presentation.renderers.game_start import render_game_start
+from ...presentation.renderers.image_crop import crop_image_auto
 from ...plugin.runtime_config import apply_hot_update
 from ...shared.fonts import resolve_font_path
 from ...shared.logging import logger
@@ -71,7 +72,7 @@ async def rs(plugin, event):
     plugin.playing_sessions.clear()
     getattr(plugin, "_session_meta", {}).clear()
     plugin.group_recent_games.clear()
-    plugin._superpower_cache.clear()
+    plugin.superpower.clear()
     plugin._game_name_cache.clear()
     plugin.achievement_poll_tasks.clear()
     plugin.achievement_snapshots.clear()
@@ -142,7 +143,7 @@ async def test_game_start_render(plugin, event, steamid: str, gameid: int):
             f"[测试开始游戏渲染] steamid={steamid} gameid={gameid} player_name={player_name} "
             f"avatar_url={avatar_url} zh_game_name={zh_game_name} en_game_name={en_game_name}"
         )
-        superpower = plugin.get_today_superpower(steamid)
+        superpower = plugin.superpower.get(steamid)
         print(f"[superpower] test_game_start_render superpower={superpower}")
         font_path = resolve_font_path('NotoSansHans-Regular.otf')
         online_count = await plugin.get_game_online_count(gameid)
@@ -162,7 +163,7 @@ async def test_game_start_render(plugin, event, steamid: str, gameid: int):
                 tmp.write(img_bytes)
                 tmp_path = tmp.name
             img = PILImage.open(tmp_path).convert("RGB")
-            cropped_img = plugin.crop_image_auto(img, bg_color=(51, 81, 66), threshold=15)
+            cropped_img = crop_image_auto(img, bg_color=(51, 81, 66), threshold=15)
             with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp2:
                 cropped_img.save(tmp2, format="PNG")
                 tmp_path = tmp2.name

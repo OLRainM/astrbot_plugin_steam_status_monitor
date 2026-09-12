@@ -1,12 +1,9 @@
 from astrbot.api.star import Star, Context
 from ..shared.logging import logger
-from ..shared.network import httpx_client_kwargs, requests_verify
 from astrbot.api.event import filter, AstrMessageEvent
 import time
-import httpx
 import asyncio
 import os
-import random
 from ..application.services.monitor_admin import MonitorAdminService
 from ..application.services.monitor_control import MonitorControlService
 from ..application.services.ranking import RankingService
@@ -19,12 +16,9 @@ from ..application.services.notification_tracking import NotificationTrackingMix
 from ..application.services.session_quit import SessionQuitMixin
 from ..application.services.status_change_tracking import StatusChangeTrackingMixin
 from ..application.services.polling_tracking import PollingTrackingMixin
-from ..domain.monitoring import MonitorStateStore, StateBackedMonitorMixin, should_skip_game
-from PIL import Image as PILImage
-import io
-from datetime import date
-import requests
+from ..domain.monitoring import MonitorStateStore, StateBackedMonitorMixin
 from ..presentation.commands import monitor, ops, rank, store
+from ..presentation.renderers.superpower import SuperpowerPicker
 from ..presentation.web.admin_api import WebAdminAPI
 from ..infrastructure.persistence.plugin_data import PersistenceMixin
 from ..infrastructure.fonts import FontPackService
@@ -64,10 +58,7 @@ class SteamStatusMonitorV3(
         self.group_pending_logs = {}      # {group_id: {steamid: {gameid: log_dict}}}
         self.group_recent_games = {}      # {group_id: [gameid, ...]}
         self._session_meta = {}           # {(group_id, sid): {player_name, game_name, avatar_url}}
-        # 超能力缓存和能力列表
-        self._superpower_cache = {}  # {(steamid, date): superpower}
-        self._abilities = None
-        self._abilities_path = str(ABILITIES_PATH)
+        self.superpower = SuperpowerPicker(ABILITIES_PATH)
         self._game_name_cache = {}  # 修复: 游戏名缓存，防止 AttributeError
         apply_runtime_config(self, config)
         self._steam_search_cache = {}
@@ -132,7 +123,10 @@ class SteamStatusMonitorV3(
         self._session_dirty = False         # session 数据脏标志
         self._recorded_quit_cache = {}      # {(steamid, gameid): timestamp} 去重用
         self.ranking_service = RankingService(self)
-        self.price_query = PriceQueryService(self, translator=self._translate_game_query)
+        self.price_query = PriceQueryService(
+            self,
+            translator=lambda query: store.translate_game_query(self, query),
+        )
         self.monitor_control = MonitorControlService(self)
         self.monitor_admin = MonitorAdminService(self)
         self.player_status_view = PlayerStatusViewService(self)
@@ -171,109 +165,6 @@ class SteamStatusMonitorV3(
         self._save_persistent_data(force=True)
         # 重置运行标志，允许下次重载正常初始化
         self._ssm_running = False
-
-    def crop_image_auto(self, img_path_or_bytes, bg_color=(20,26,33), threshold=25):
-        """
-        自动裁剪图片内容区域，去除边缘与 bg_color 相近的空白。
-        支持本地路径、bytes、URL、PIL.Image。
-        """
-        import numpy as np
-        # 新增：如果已经是PIL.Image对象，直接用
-        if isinstance(img_path_or_bytes, PILImage.Image):
-            img = img_path_or_bytes.convert("RGB")
-        elif isinstance(img_path_or_bytes, str) and (img_path_or_bytes.startswith("http://") or img_path_or_bytes.startswith("https://")):
-            resp = requests.get(img_path_or_bytes, timeout=15, verify=requests_verify())
-            resp.raise_for_status()
-            img = PILImage.open(io.BytesIO(resp.content)).convert("RGB")
-        elif isinstance(img_path_or_bytes, bytes):
-            img = PILImage.open(io.BytesIO(img_path_or_bytes)).convert("RGB")
-        else:
-            img = PILImage.open(img_path_or_bytes).convert("RGB")
-        arr = np.array(img)
-        # 自动检测背景色（取四角平均色）
-        h, w, _ = arr.shape
-        corners = [arr[0,0], arr[0,-1], arr[-1,0], arr[-1,-1]]
-        avg_bg = np.mean(corners, axis=0)
-        # 计算每个像素与背景色的距离
-        diff = np.abs(arr - avg_bg).sum(axis=2)
-        mask = diff > threshold
-        coords = np.argwhere(mask)
-        if coords.size == 0:
-            return img
-        y0, x0 = coords.min(axis=0)
-        y1, x1 = coords.max(axis=0) + 1
-        # 防止裁剪过度，留出2px边距
-        y0 = max(y0 - 0, 0)
-        x0 = max(x0 - 0, 0)
-        y1 = min(y1 - 0, arr.shape[0])
-        x1 = min(x1 - 0, arr.shape[1])
-        cropped = img.crop((x0, y0, x1, y1))
-        return cropped
-
-    async def _translate_game_query(self, query: str) -> str:
-        return await store.translate_game_query(self, query)
-
-    async def _daily_rank_push(self, test_mode=False):
-        """推送昨日榜单；默认按目标群独立聚合，显式全局模式才共享总榜。"""
-        await self.rank_view.push_daily()
-
-    def _should_skip_game(self, gameid):
-        """根据黑白名单配置判断是否应跳过该游戏的监控/播报"""
-        return should_skip_game(self.config, gameid)
-
-    def _get_day_key(self, offset_days=0):
-        """基于凌晨4:00边界的日期键。"""
-        return self.ranking_service.day_key(offset_days)
-
-    def _get_rank_data(self, days=1, group_id=None, base_day_offset=0):
-        """聚合游玩时长数据，返回已排序的排行榜列表。"""
-        ranking = self.ranking_service
-        return ranking.aggregate(
-            days=days,
-            sids=ranking.target_sids(group_id),
-            base_day_offset=base_day_offset,
-        )
-
-    def _record_playtime(self, sid, gameid, game_name, duration_min):
-        """记录游玩时长到 play_records，带5分钟去重（防止多群重复记录）"""
-        self.ranking_service.record_playtime(sid, gameid, game_name, duration_min)
-
-    async def get_game_online_count(self, gameid):
-        '''通过 Steam Web API 获取当前游戏在线人数'''
-        if not gameid:
-            return None
-        url = f"{self.STEAM_API_BASE}/ISteamUserStats/GetNumberOfCurrentPlayers/v1/?appid={gameid}"
-        try:
-            async with httpx.AsyncClient(timeout=10, **httpx_client_kwargs(self.proxy)) as client:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return data.get('response', {}).get('player_count')
-        except Exception as e:
-            logger.warning(f"获取在线人数失败: {e} (gameid={gameid})")
-        return None
-
-    def _steam_parent(self, event):
-        """返回 (触发者昵称, QQ头像URL)；获取失败返回 (None, None)。用于 Steam 列表顶部显示触发者头像/名称。"""
-        try:
-            _sid = event.get_sender_id()
-            _name = event.get_sender_name()
-        except Exception:
-            return None, None
-        url = f"https://q1.qlogo.cn/g?b=qq&nk={_sid}&s=640" if _sid else None
-        return _name, url
-
-    def get_today_superpower(self, steamid):
-        today = date.today().isoformat()
-        cache_key = (steamid, today)
-        if cache_key in self._superpower_cache:
-            return self._superpower_cache[cache_key]
-        if self._abilities is None:
-            with open(self._abilities_path, encoding="utf-8") as abilities_file:
-                self._abilities = [line.strip() for line in abilities_file if line.strip()]
-        superpower = random.Random(f"{steamid}-{today}").choice(self._abilities)
-        self._superpower_cache[cache_key] = superpower
-        return superpower
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("steam on")

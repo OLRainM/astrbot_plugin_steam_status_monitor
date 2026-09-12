@@ -82,11 +82,12 @@ class PollingTrackingMixin:
                 push_hour = getattr(self, 'rank_push_hour', 8)
                 push_minute = getattr(self, 'rank_push_minute', 30)
                 if now_dt.hour == push_hour and now_dt.minute == push_minute:
-                    push_date_key = self._get_day_key(-1)
-                    if self._last_rank_push_date != push_date_key and hasattr(self, 'rank_push_groups') and (self.rank_push_groups or getattr(self, 'rank_push_all', False)):
+                    ranking = getattr(self, "ranking_service", None)
+                    push_date_key = ranking.day_key(-1) if ranking is not None else None
+                    if push_date_key and self._last_rank_push_date != push_date_key and hasattr(self, 'rank_push_groups') and (self.rank_push_groups or getattr(self, 'rank_push_all', False)):
                         self._last_rank_push_date = push_date_key
                         logger.info(f"[排行榜] 开始每日自动推送，时间={push_hour}:{push_minute:02d}，目标群: {self.rank_push_groups if self.rank_push_groups else '全部群(rank_push_all)'}")
-                        asyncio.create_task(self._daily_rank_push())
+                        asyncio.create_task(self.rank_view.push_daily())
                 # 节流保存：本轮有脏数据且超过间隔则落盘，避免每次 check_status_change 都写盘
                 if getattr(self, '_data_dirty', False) and (time.time() - getattr(self, '_last_save_time', 0)) >= getattr(self, '_save_interval', 300):
                     try:

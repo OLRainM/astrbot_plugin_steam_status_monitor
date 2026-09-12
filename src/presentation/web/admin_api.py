@@ -252,11 +252,8 @@ class WebAdminAPI:
 
     async def _api_dashboard_stats(self, request):
         p = self.plugin
-        today = (
-            p._get_day_key(0)
-            if hasattr(p, "_get_day_key")
-            else datetime.now().strftime("%Y-%m-%d")
-        )
+        ranking = getattr(p, "ranking_service", None)
+        today = ranking.day_key(0) if ranking is not None else datetime.now().strftime("%Y-%m-%d")
         last_update = datetime.now().strftime("%Y-%m-%d %H:%M")
         return await self._cached_response(
             ("dashboard", today),
@@ -1136,7 +1133,8 @@ class WebAdminAPI:
                         total_minutes += mins
 
         # 今天游戏
-        today = p._get_day_key(0) if hasattr(p, "_get_day_key") else datetime.now().strftime("%Y-%m-%d")
+        ranking = getattr(p, "ranking_service", None)
+        today = ranking.day_key(0) if ranking is not None else datetime.now().strftime("%Y-%m-%d")
         play_records = getattr(p, "play_records", {}) or {}
         today_games = []
         today_data = play_records.get(today, {}).get(steamid, {})

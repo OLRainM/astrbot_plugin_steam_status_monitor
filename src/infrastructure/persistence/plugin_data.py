@@ -417,6 +417,16 @@ class PersistenceMixin:
         })
         self._session_dirty = True
 
+    def _get_day_key(self, offset_days=0):
+        ranking = getattr(self, "ranking_service", None)
+        if ranking is not None:
+            return ranking.day_key(offset_days)
+        current = datetime.now()
+        if current.hour < 4:
+            current = current - timedelta(days=1)
+        current = current + timedelta(days=offset_days)
+        return current.strftime("%Y-%m-%d")
+
     # ========== QQ-SteamID 绑定系统 ==========
 
     def _load_bind_data(self):

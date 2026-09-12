@@ -1,6 +1,6 @@
 # 命令层拆分：看法与修正方案
 
-- 状态：第 1–3 步已落地；第 4 步部分完成
+- 状态：第 1–4 步已落地
 - 日期：2026-09-12
 - 范围：`src/plugin/steam_status_monitor.py` 的命令面瘦身；不改会话状态机、轮询、Steam API 语义
 - 对照：`REFACTORING.md` 第 5 节「明确未拆分的内容」；`docs/adr/adr-inline-passthrough-helpers.md`
@@ -209,7 +209,7 @@ Mixin 方面：`SessionQuitMixin` 若只剩兼容空壳可删；轮询 / 通知 
 - 第 1 步已完成：`PriceQueryService`、`MonitorAdminService.add_players` / 绑定 / 推送路由、`PlayerStatusViewService`。
 - 第 2 步已完成：`RankingService` 持有日界/去重/聚合；`RankViewService` 管展示、昨日推送和 `rank_on`。
 - 第 3 步已完成：`src/presentation/commands/{monitor,store,rank,ops}.py` 承接胶水；`SteamStatusMonitorV3` 只留 `@filter` 注册桩。
-- 第 4 步部分完成：`runtime_config.py` 已接管配置加载与 `/steam set`；陈旧状态判断在 persistence。主体仍约 515 行，因为 `__init__`、生命周期和 `crop_image_auto` / `get_today_superpower` / 在线人数仍挂在组合根。不要为了压到 150 行再拆注册桩。
+- 第 4 步已完成：`runtime_config.py` 管配置；陈旧状态判断在 persistence。`crop_image_auto` / `SuperpowerPicker` 下沉到 renderers，在线人数进 Steam 客户端，日界/聚合/记账走 `RankingService`，列表触发者信息走 `steam_list.list_parent`。组合根只剩构造、生命周期和注册桩；不要再拆注册桩。
 
 ### 第 1 步：抽出已有重复的应用服务（不改目录也能做）
 
@@ -236,6 +236,8 @@ Mixin 方面：`SessionQuitMixin` 若只剩兼容空壳可删；轮询 / 通知 
 ### 第 4 步：组合根再瘦
 
 把 `__init__` 里成块的「读配置赋属性」收成 `load_runtime_config(config)`；陈旧状态判断跟 persistence。插件文件只剩：构造、注册 Web、拉任务、`terminate`、命令桩。
+
+展示辅助不要再挂组合根：裁图和超能力进 renderers，在线人数进 Steam 客户端，日界/聚合走 `RankingService`。
 
 若仍觉得命令桩占行，保持现状。那是框架税，删不掉。
 

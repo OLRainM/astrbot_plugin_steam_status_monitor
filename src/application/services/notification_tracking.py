@@ -62,7 +62,7 @@ class NotificationTrackingMixin:
             if noti["type"] == "start":
                 status = noti.get("status", {})
                 avatar_url = status.get("avatarfull") or status.get("avatar")
-                superpower = self.get_today_superpower(noti["sid"])
+                superpower = self.superpower.get(noti["sid"])
                 font_path = resolve_font_path("NotoSansHans-Regular.otf")
                 zh_game_name, en_game_name = await self.get_game_names(noti["gameid"], noti["game"])
                 img_bytes = await render_game_start(

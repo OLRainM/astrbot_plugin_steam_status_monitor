@@ -80,9 +80,6 @@ class _StatusMonitor:
         self._personastate = personastate
         self._gameid = gameid
 
-    def _steam_parent(self, event):
-        return None, None
-
     async def fetch_player_statuses_batch(self, steam_ids):
         return {
             sid: {

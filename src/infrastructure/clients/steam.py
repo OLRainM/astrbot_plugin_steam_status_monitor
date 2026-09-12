@@ -436,6 +436,21 @@ class SteamClientMixin:
         # 不缓存 fallback，让下次还能重试
         return fallback_name or "未知游戏"
 
+    async def get_game_online_count(self, gameid):
+        """通过 Steam Web API 获取当前游戏在线人数。"""
+        if not gameid:
+            return None
+        url = f"{self.STEAM_API_BASE}/ISteamUserStats/GetNumberOfCurrentPlayers/v1/?appid={gameid}"
+        try:
+            async with httpx.AsyncClient(timeout=10, **httpx_client_kwargs(self.proxy)) as client:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("response", {}).get("player_count")
+        except Exception as e:
+            logger.warning(f"获取在线人数失败: {e} (gameid={gameid})")
+        return None
+
     async def get_game_names(self, gameid, fallback_name=None):
         '''
         返回 (中文名, 英文名)，如无则 fallback_name 或 "未知游戏"

@@ -37,4 +37,4 @@ async def rank_on(plugin, event, param: str = ""):
     result = plugin.rank_view.configure_push(param, event.get_group_id() or "default")
     yield event.plain_result(result.message)
     if result.should_push:
-        await plugin._daily_rank_push(test_mode=True)
+        await plugin.rank_view.push_daily()

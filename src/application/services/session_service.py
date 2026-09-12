@@ -294,16 +294,20 @@ class SessionService:
                 session.group_id,
             )
         else:
-            plugin._record_playtime(session.sid, session.gameid, game_name, duration_min)
-            plugin._record_session(
-                sid=session.sid,
-                gameid=session.gameid,
-                game_name=game_name,
-                start_time=session.started_at,
-                end_time=session.exited_at or session.closed_at,
-                duration_min=duration_min,
-                group_id=session.group_id,
-            )
+            record_playtime = getattr(plugin, "_record_playtime", None)
+            record_session = getattr(plugin, "_record_session", None)
+            if callable(record_playtime):
+                record_playtime(session.sid, session.gameid, game_name, duration_min)
+            if callable(record_session):
+                record_session(
+                    sid=session.sid,
+                    gameid=session.gameid,
+                    game_name=game_name,
+                    start_time=session.started_at,
+                    end_time=session.exited_at or session.closed_at,
+                    duration_min=duration_min,
+                    group_id=session.group_id,
+                )
         last_quit = plugin.group_last_quit_times.setdefault(session.group_id, {})
         last_quit.setdefault(session.sid, {})[session.gameid] = int(session.closed_at or session.exited_at or 0)
 
@@ -429,7 +433,4 @@ class SessionService:
 
     def _skip_game(self, gameid) -> bool:
         plugin = self._plugin
-        skip = getattr(plugin, "_should_skip_game", None)
-        if callable(skip):
-            return bool(skip(gameid))
         return should_skip_game(getattr(plugin, "config", {}) or {}, gameid)

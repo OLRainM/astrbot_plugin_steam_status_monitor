@@ -6,7 +6,18 @@ from ...presentation.renderers.steam_list import render_steam_list_image
 from ...presentation.renderers.game_start import get_avatar_frame_url, get_avatar_frame_path
 from .player_status_view import PlayerStatusViewService, build_player_row
 
-__all__ = ["build_player_row", "handle_steam_list", "render_user_list_image"]
+__all__ = ["build_player_row", "handle_steam_list", "render_user_list_image", "list_parent"]
+
+
+def list_parent(event):
+    """返回 (触发者昵称, QQ头像URL)；获取失败返回 (None, None)。"""
+    try:
+        sender_id = event.get_sender_id()
+        sender_name = event.get_sender_name()
+    except Exception:
+        return None, None
+    url = f"https://q1.qlogo.cn/g?b=qq&nk={sender_id}&s=640" if sender_id else None
+    return sender_name, url
 
 
 async def collect_list_assets(plugin, user_list, *, proxy=None):
@@ -48,7 +59,7 @@ async def collect_list_assets(plugin, user_list, *, proxy=None):
 async def render_user_list_image(plugin, event, user_list, *, font_path: Optional[str] = None, proxy=None):
     proxy = plugin.proxy if proxy is None else proxy
     avatar_frame_paths, covers, steam_style = await collect_list_assets(plugin, user_list, proxy=proxy)
-    parent_name, parent_avatar_url = plugin._steam_parent(event)
+    parent_name, parent_avatar_url = list_parent(event)
     img_bytes = await render_steam_list_image(
         plugin.data_dir,
         user_list,

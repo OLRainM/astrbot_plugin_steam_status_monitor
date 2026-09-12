@@ -51,6 +51,8 @@ class ModularStructureTests(unittest.TestCase):
             "src/presentation/commands/ops.py",
             "src/presentation/web/admin_api.py",
             "src/presentation/renderers/game_start.py",
+            "src/presentation/renderers/image_crop.py",
+            "src/presentation/renderers/superpower.py",
             "src/shared/paths.py",
             "assets/abilities.txt",
             "assets/fonts/manifest.json",
@@ -128,6 +130,22 @@ class ModularStructureTests(unittest.TestCase):
         ]
         self.assertEqual(1, method_names.count("steam_push_group"))
         self.assertEqual(1, method_names.count("steam_delpush_group"))
+
+    def test_composition_root_does_not_keep_passthrough_helpers(self):
+        text = (PROJECT_ROOT / "src/plugin/steam_status_monitor.py").read_text(encoding="utf-8")
+        forbidden = (
+            "def crop_image_auto",
+            "def get_today_superpower",
+            "async def get_game_online_count",
+            "def _steam_parent",
+            "def _get_rank_data",
+            "def _record_playtime",
+            "def _should_skip_game",
+            "async def _daily_rank_push",
+            "async def _translate_game_query",
+        )
+        hits = [token for token in forbidden if token in text]
+        self.assertEqual([], hits)
 
     def test_command_modules_do_not_own_core_rules(self):
         commands_dir = PROJECT_ROOT / "src/presentation/commands"
