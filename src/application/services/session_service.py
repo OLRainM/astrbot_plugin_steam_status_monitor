@@ -1,6 +1,7 @@
 import asyncio
 from typing import Any, Dict, Optional, Tuple
 
+from ...domain.monitoring.game_filter import should_skip_game
 from ...domain.monitoring.session import PlayingSession, apply
 from ...presentation.formatters.status import format_play_duration
 
@@ -318,7 +319,7 @@ class SessionService:
             achievement_monitor.clear_game_achievements(session.group_id, session.sid, session.gameid)
 
         monitor_on = getattr(plugin, "group_monitor_enabled", {}).get(session.group_id, True)
-        if not skip_push and monitor_on and not getattr(plugin, "_should_skip_game", lambda _gid: False)(session.gameid) and plugin.config.get("enable_game_end_notify", True):
+        if not skip_push and monitor_on and not self._skip_game(session.gameid) and plugin.config.get("enable_game_end_notify", True):
             last_state = plugin.group_last_states.get(session.group_id, {}).get(session.sid) or {}
             plugin._pending_end_notifications.setdefault(session.group_id, []).append({
                 "type": "end",
@@ -352,7 +353,7 @@ class SessionService:
             if len(recent) > 8:
                 recent.pop(0)
         monitor_on = getattr(plugin, "group_monitor_enabled", {}).get(session.group_id, True)
-        if not skip_push and monitor_on and not getattr(plugin, "_should_skip_game", lambda _gid: False)(session.gameid) and plugin.config.get("enable_game_start_notify", True):
+        if not skip_push and monitor_on and not self._skip_game(session.gameid) and plugin.config.get("enable_game_start_notify", True):
             plugin._pending_end_notifications.setdefault(session.group_id, []).append({
                 "type": "start",
                 "name": player_name or session.sid,
@@ -370,7 +371,7 @@ class SessionService:
         plugin = self._plugin
         if not plugin.config.get("enable_achievement_poll", True):
             return
-        if getattr(plugin, "_should_skip_game", lambda _gid: False)(session.gameid):
+        if self._skip_game(session.gameid):
             return
         key = (session.group_id, session.sid, session.gameid)
         if key in getattr(plugin, "achievement_poll_tasks", {}):
@@ -397,7 +398,7 @@ class SessionService:
         if skip_push or not plugin.config.get("enable_network_fluctuation_notify", True):
             return
         # 黑白名单过滤：网络波动提示与游戏开始/结束播报一致，黑名单游戏不再推送波动提示
-        if getattr(plugin, "_should_skip_game", lambda _gid: False)(session.gameid):
+        if self._skip_game(session.gameid):
             return
         notify_sessions = plugin._get_notify_sessions(session.group_id, session.sid)
         if not notify_sessions:
@@ -425,3 +426,10 @@ class SessionService:
         except RuntimeError:
             return
         asyncio.create_task(_notify())
+
+    def _skip_game(self, gameid) -> bool:
+        plugin = self._plugin
+        skip = getattr(plugin, "_should_skip_game", None)
+        if callable(skip):
+            return bool(skip(gameid))
+        return should_skip_game(getattr(plugin, "config", {}) or {}, gameid)

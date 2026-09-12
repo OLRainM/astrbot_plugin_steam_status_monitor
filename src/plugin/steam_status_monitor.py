@@ -11,10 +11,16 @@ import asyncio
 import os
 import random
 from ..application.services.openbox import handle_openbox
-from ..application.services.steam_list import handle_steam_list, build_player_row
+from ..application.services.steam_list import handle_steam_list, render_user_list_image
 from ..application.services.monitor_admin import MonitorAdminService
+from ..application.services.monitor_control import MonitorControlService
 from ..application.services.ranking import RankingService
 from ..application.services.price_query import PriceQueryService
+from ..application.services.player_status_view import (
+    PlayerStatusViewService,
+    format_alllist_text,
+    sort_rows_for_image,
+)
 import re
 from ..application.services.achievement_monitor import AchievementMonitor
 from ..application.services.achievement_tracking import AchievementTrackingMixin
@@ -26,7 +32,7 @@ from ..presentation.renderers.game_start import render_game_start
 from ..presentation.renderers.game_end import render_game_end
 from ..presentation.renderers.rank import render_rank_image
 from ..presentation.renderers.game_detail import render_game_detail_image
-from ..domain.monitoring import MonitorStateStore, StateBackedMonitorMixin
+from ..domain.monitoring import MonitorStateStore, StateBackedMonitorMixin, should_skip_game
 from ..shared.fonts import resolve_font_path
 from ..domain.ranking.push_scopes import build_rank_push_scopes
 from PIL import Image as PILImage
@@ -146,6 +152,8 @@ class SteamStatusMonitorV3(
         self._recorded_quit_cache = {}      # {(steamid, gameid): timestamp} 去重用
         self.ranking_service = RankingService(self)
         self.price_query = PriceQueryService(self, translator=self._translate_game_query)
+        self.monitor_control = MonitorControlService(self)
+        self.player_status_view = PlayerStatusViewService(self)
         self.rank_push_groups = []          # 开启了每日排行榜推送的群列表
         self.rank_push_all = False           # True=全群统一推送全局排行（只渲染一次）
         self._last_rank_push_date = None    # 记录上次推送日期，防止同一天重复推送
@@ -225,52 +233,10 @@ class SteamStatusMonitorV3(
     async def steam_on(self, event: AstrMessageEvent):
         '''手动启动Steam状态监控轮询（分群）'''
         group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
-        if not is_valid_group_id(group_id):
-            yield event.plain_result("请在群聊中使用该命令，私聊无法启动群监控。")
-            return
-        self.group_monitor_enabled[group_id] = True
-        self._save_group_switches()
-        if not self.API_KEY:
-            yield event.plain_result("未配置 Steam API Key，请先在插件配置中填写 steam_api_key。")
-            return
-        steam_ids = self.group_steam_ids.get(group_id, [])
-        if not steam_ids or not any(isinstance(x, str) and x.strip() for x in steam_ids):
-            yield event.plain_result(
-                "未设置监控的 SteamID 列表，请先在插件配置中填写 steam_ids，"
-                "或使用 /steam addid [SteamID] 添加要监控的玩家。"
-            )
-            return
-        if group_id in self.running_groups:
-            yield event.plain_result("本群Steam监控已在运行。")
-            return
-        self.running_groups.add(group_id)
-        if not hasattr(self, 'notify_sessions'):
-            self.notify_sessions = {}
-        self.notify_sessions[group_id] = event.unified_msg_origin
-        self._record_platform_id(event)
-        self._save_notify_session()
-        # 初始化状态
-        if group_id not in self.group_last_states:
-            self.group_last_states[group_id] = {}
-        # 批量查询所有玩家状态，减少API调用
-        status_map = await self.fetch_player_statuses_batch(steam_ids) if steam_ids else {}
-        now = int(time.time())
-        for sid in steam_ids:
-            status = status_map.get(sid)
-            if not status:
-                continue
-            self.group_last_states[group_id][sid] = status
-            await self.session_service.handle(
-                group_id,
-                sid,
-                status.get('gameid'),
-                now,
-                player_name=status.get('name') or sid,
-                current_game_name=status.get('gameextrainfo') or '未知游戏',
-                status=status,
-                skip_push=True,
-            )
-        yield event.plain_result("本群Steam状态监控启动完成喔！ヾ(≧ω≦)ゞ")
+        result = await self.monitor_control.start(group_id, notify_session=event.unified_msg_origin)
+        if result.ok:
+            self._record_platform_id(event)
+        yield event.plain_result(result.message)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("steam addid")
@@ -369,17 +335,8 @@ class SteamStatusMonitorV3(
         unhandled = len(steamid_list) - len(added) - len(pushed) - len(already) - len(already_pushed)
         if unhandled:
             msg += f"本群监控组人数已达上限（{limit}人），部分ID未添加。\n"
-        # 自动启用本群监控（幂等）
-        if added and group_id not in self.running_groups:
-            self.group_monitor_enabled[group_id] = True
-            self.running_groups.add(group_id)
-            if not hasattr(self, 'notify_sessions'):
-                self.notify_sessions = {}
-            self.notify_sessions[group_id] = event.unified_msg_origin
+        if added and self.monitor_control.ensure_running(group_id, notify_session=event.unified_msg_origin):
             self._record_platform_id(event)
-            self._save_notify_session()
-            if group_id not in self.group_last_states:
-                self.group_last_states[group_id] = {}
             msg += "监控已自动启动。\n"
         yield event.plain_result(msg.strip() if msg else "未添加任何SteamID。")
 
@@ -592,13 +549,7 @@ class SteamStatusMonitorV3(
     async def steam_list(self, event: AstrMessageEvent):
         '''列出本群所有玩家当前状态（分群）'''
         group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
-        direct_steam_ids = self.group_steam_ids.get(group_id, [])
-        push_steam_ids = [
-            sid
-            for sid, push_groups in (getattr(self, 'push_groups', {}) or {}).items()
-            if group_id in {str(target) for target in push_groups}
-        ]
-        steam_ids = list(dict.fromkeys([*direct_steam_ids, *push_steam_ids]))
+        _, _, steam_ids = self.player_status_view.steam_ids_for_group(group_id)
         if not self.API_KEY:
             yield event.plain_result("未配置 Steam API Key，请先在插件配置中填写 steam_api_key。")
             return
@@ -1089,51 +1040,12 @@ class SteamStatusMonitorV3(
         if not status:
             yield event.plain_result(f"无法获取 {sid} 的Steam状态")
             return
-        name = self._resolve_bind_name(sid, status.get('name') or sid)
-        gameid = status.get('gameid')
-        game = status.get('gameextrainfo')
-        zh_game_name = await self.get_chinese_game_name(gameid, game) if gameid else (game or '')
-        now = int(time.time())
         group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
-        start_time = self.session_service.started_at(group_id, sid, gameid) if gameid else None
-        user_list = [build_player_row(
-            sid,
-            status,
-            name=name,
-            zh_game_name=zh_game_name,
-            start_time=start_time,
-            now=now,
-        )]
-        # 获取头像框
-        from ..presentation.renderers.game_start import get_avatar_frame_url, get_avatar_frame_path
-        avatar_frame_paths = {}
-        fp = await get_avatar_frame_path(self.data_dir, sid, proxy=self.proxy)
-        if not fp:
-            frame_url = await get_avatar_frame_url(sid, proxy=self.proxy)
-            if frame_url: fp = await get_avatar_frame_path(self.data_dir, sid, frame_url, proxy=self.proxy)
-        if fp: avatar_frame_paths[sid] = fp
-        # 渲染列表卡片（新版steam风格不展示封面；旧版卡片风格需要封面，仅在关闭新风格时预取）
-        from ..presentation.renderers.steam_list import render_steam_list_image
+        primary = self.player_status_view.primary_group_of(sid, group_id)
+        user_list = [await self.player_status_view.build_row(sid, status, group_id=primary)]
         font_path = resolve_font_path('NotoSansHans-Regular.otf')
-        steam_style = self.config.get('enable_steam_style', False)
-        covers = {}
-        if not steam_style and gameid:
-            from ..presentation.renderers.game_start import get_cover_path
-            cp = await get_cover_path(
-                self.data_dir, gameid, game or zh_game_name,
-                sgdb_api_key=self.SGDB_API_KEY,
-                appid=gameid,
-                proxy=self.proxy,
-                sgdb_api_base=self.SGDB_API_BASE,
-            )
-            if cp: covers[sid] = cp
-        parent_name, parent_avatar_url = self._steam_parent(event)
-        img_bytes = await render_steam_list_image(self.data_dir, user_list, font_path=font_path, proxy=self.proxy, avatar_frame_paths=avatar_frame_paths, covers=covers, steam_style=steam_style, parent_name=parent_name, parent_avatar_url=parent_avatar_url)
-        if img_bytes:
-            import tempfile
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                tmp.write(img_bytes)
-                tmp_path = tmp.name
+        tmp_path = await render_user_list_image(self, event, user_list, font_path=font_path, proxy=self.proxy)
+        if tmp_path:
             yield event.image_result(tmp_path)
         else:
             yield event.plain_result("渲染图片失败")
@@ -1150,39 +1062,24 @@ class SteamStatusMonitorV3(
     async def steam_off(self, event: AstrMessageEvent):
         '''彻底停止本群Steam状态监控轮询，释放轮询资源'''
         group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
-        self.group_monitor_enabled[group_id] = False
-        if group_id in self.running_groups:
-            self.running_groups.remove(group_id)
-        self._save_group_switches()
-        # 清除该群的轮询时间表，停止轮询（/steam on 后会重新初始化）
-        self.next_poll_time.pop(group_id, None)
-        # 停用后不再推送本群缓冲通知；会话仍保留，由 tick_due 到期结算时长
-        self._pending_end_notifications.pop(group_id, None)
-        # 取消该群所有成就轮询任务，释放资源
-        keys_to_cancel = [k for k in list(self.achievement_poll_tasks.keys()) if k[0] == group_id]
-        for key in keys_to_cancel:
-            task = self.achievement_poll_tasks.pop(key, None)
-            if task:
-                task.cancel()
-        yield event.plain_result(f"已为本群彻底关闭Steam监控，轮询已停止。使用 /steam on 可重新启动。")
+        result = self.monitor_control.stop(group_id)
+        yield event.plain_result(result.message)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("steam achievement_on")
     async def steam_achievement_on(self, event: AstrMessageEvent):
         """开启本群Steam成就推送"""
         group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
-        self.group_achievement_enabled[group_id] = True
-        self._save_group_switches()
-        yield event.plain_result(f"已为本群开启Steam成就推送。")
+        result = self.monitor_control.set_achievement(group_id, True)
+        yield event.plain_result(result.message)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("steam achievement_off")
     async def steam_achievement_off(self, event: AstrMessageEvent):
         """关闭本群Steam成就推送"""
         group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
-        self.group_achievement_enabled[group_id] = False
-        self._save_group_switches()
-        yield event.plain_result(f"已为本群关闭Steam成就推送。")
+        result = self.monitor_control.set_achievement(group_id, False)
+        yield event.plain_result(result.message)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("steam test_achievement_render")
@@ -1441,23 +1338,7 @@ class SteamStatusMonitorV3(
 
     def _should_skip_game(self, gameid):
         """根据黑白名单配置判断是否应跳过该游戏的监控/播报"""
-        if not gameid:
-            return False
-        mode = self.config.get('game_filter_mode', '全部游戏')
-        if mode == '全部游戏':
-            return False
-        ids_str = self.config.get('game_filter_ids', '')
-        if not ids_str or not ids_str.strip():
-            return False
-        try:
-            filter_ids = [x.strip() for x in ids_str.split(',') if x.strip()]
-        except Exception:
-            return False
-        if mode == '白名单':
-            return str(gameid) not in filter_ids
-        elif mode == '黑名单':
-            return str(gameid) in filter_ids
-        return False
+        return should_skip_game(self.config, gameid)
 
     def _get_day_key(self, offset_days=0):
         """基于凌晨4:00边界的日期键。"""
@@ -1505,102 +1386,14 @@ class SteamStatusMonitorV3(
     @filter.command("steam alllist")
     async def steam_alllist(self, event: AstrMessageEvent, mode: str = "img"):
         '''所有群聊玩家状态（默认图片，steam alllist text 输出文本）'''
-        from ..presentation.renderers.steam_list import render_steam_list_image
-        from ..presentation.renderers.game_start import get_avatar_frame_url, get_avatar_frame_path
-        user_list = []
-        now = int(time.time())
-        all_sids = []
-        for gid_ in self.group_steam_ids:
-            all_sids.extend(self.group_steam_ids[gid_])
-        status_map = await self.fetch_player_statuses_batch(all_sids) if all_sids else {}
-        for group_id, steam_ids in self.group_steam_ids.items():
-            next_poll = self.next_poll_time.get(group_id, {})
-            for sid in steam_ids:
-                nt = next_poll.get(sid, now)
-                sl = int(nt - now)
-                p_str = f"下次轮询{sl}秒后" if sl < 60 else f"下次轮询{sl//60}分钟后"
-                status = status_map.get(sid)
-                name = self._resolve_bind_name(sid, (status or {}).get("name") or sid)
-                gameid = (status or {}).get("gameid")
-                game = (status or {}).get("gameextrainfo")
-                zh_game_name = await self.get_chinese_game_name(gameid, game) if gameid else (game or "未知游戏")
-                start_time = self.session_service.started_at(group_id, sid, gameid) if gameid else None
-                user_list.append(build_player_row(
-                    sid,
-                    status,
-                    name=name,
-                    zh_game_name=zh_game_name,
-                    start_time=start_time,
-                    now=now,
-                    group_id=group_id,
-                    poll_str=p_str,
-                ))
-        # 纯文本输出模式
+        user_list = await self.player_status_view.build_all_rows()
         if mode.lower() == 'text':
-            from ..presentation.renderers.steam_list import get_status_text
-            lines = ["=== Steam 全群玩家状态 ===\n"]
-            by_group = {}
-            for u in user_list:
-                by_group.setdefault(u.get('group_id', '?'), []).append(u)
-            for gid, members in by_group.items():
-                lines.append(f"📋 群: {gid}")
-                for u in members:
-                    sid_shown = u['sid']
-                    sicon = {'playing': '🎮', 'online': '🔵', 'offline': '💤',
-                             'busy': '🔴', 'away': '🟣', 'snooze': '🟣', 'error': '⚠️'}.get(u['status'], '❓')
-                    name = u['name']
-                    stext = get_status_text(u['status'])
-                    detail = f" 正在玩：{u['game']}" if u['status'] == 'playing' and u.get('game') else ""
-                    play = f" | 时长：{u['play_str']}" if u.get('play_str') else ""
-                    offline_info = f" | {u['play_str']}" if u['status'] == 'offline' and u.get('play_str') else ""
-                    poll = f" | {u.get('poll_str','')}" if u.get('poll_str') else ""
-                    lines.append(f"  {sicon} {name} {stext}{detail}{play}{offline_info}")
-                    lines.append(f"     ID: {sid_shown}{poll}")
-                lines.append("")
-            online_count = sum(1 for u in user_list if u['status'] in ('playing','online','away','snooze','busy'))
-            lines.append(f"📊 在线: {online_count} / 总数: {len(user_list)}")
-            yield event.plain_result("\n".join(lines))
+            yield event.plain_result(format_alllist_text(user_list))
             return
-        # 图片输出模式（默认）
-        # 按状态排序：游戏中 > 在线 > 忙碌 > 离开/打盹 > 离线 > 异常
-        _status_rank = {'playing': 0, 'online': 1, 'busy': 2, 'away': 3, 'snooze': 4, 'offline': 5, 'error': 6}
-        user_list.sort(key=lambda u: _status_rank.get(u['status'], 9))
-        avatar_frame_paths = {}
-        for u in user_list:
-            sid = u.get('sid', '')
-            if sid:
-                fp = await get_avatar_frame_path(self.data_dir, sid, proxy=self.proxy)
-                if not fp:
-                    frame_url = await get_avatar_frame_url(sid, proxy=self.proxy)
-                    if frame_url:
-                        fp = await get_avatar_frame_path(self.data_dir, sid, frame_url, proxy=self.proxy)
-                if fp:
-                    avatar_frame_paths[sid] = fp
+        user_list = sort_rows_for_image(user_list)
         font_path = resolve_font_path('NotoSansHans-Regular.otf')
-        # 新版steam风格不展示封面；旧版卡片风格需要封面，仅在关闭新风格时预取
-        steam_style = self.config.get('enable_steam_style', False)
-        covers = {}
-        if not steam_style:
-            for u in user_list:
-                gid = u.get('gameid', '')
-                if gid:
-                    from ..presentation.renderers.game_start import get_cover_path
-                    cp = await get_cover_path(
-                        self.data_dir, gid, u.get('game', ''),
-                        sgdb_api_key=self.SGDB_API_KEY,
-                        appid=gid,
-                        proxy=self.proxy,
-                        sgdb_api_base=self.SGDB_API_BASE,
-                    )
-                    if cp:
-                        covers[u['sid']] = cp
-        parent_name, parent_avatar_url = self._steam_parent(event)
-        img_bytes = await render_steam_list_image(self.data_dir, user_list, font_path=font_path, proxy=self.proxy, avatar_frame_paths=avatar_frame_paths, covers=covers, steam_style=steam_style, parent_name=parent_name, parent_avatar_url=parent_avatar_url)
-        if img_bytes:
-            import tempfile
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                tmp.write(img_bytes)
-                tmp_path = tmp.name
+        tmp_path = await render_user_list_image(self, event, user_list, font_path=font_path, proxy=self.proxy)
+        if tmp_path:
             yield event.image_result(tmp_path)
         else:
             yield event.plain_result("渲染图片失败")

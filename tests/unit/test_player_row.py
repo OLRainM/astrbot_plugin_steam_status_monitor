@@ -1,4 +1,4 @@
-from src.application.services.steam_list import build_player_row
+from src.application.services.player_status_view import build_player_row
 
 
 def test_build_player_row_error_when_status_missing():
