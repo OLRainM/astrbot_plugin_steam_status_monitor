@@ -21,6 +21,7 @@ from ..application.services.player_status_view import (
     format_alllist_text,
     sort_rows_for_image,
 )
+from ..application.services.rank_view import RankViewService, parse_rank_period
 import re
 from ..application.services.achievement_monitor import AchievementMonitor
 from ..application.services.achievement_tracking import AchievementTrackingMixin
@@ -30,7 +31,6 @@ from ..application.services.status_change_tracking import StatusChangeTrackingMi
 from ..application.services.polling_tracking import PollingTrackingMixin
 from ..presentation.renderers.game_start import render_game_start
 from ..presentation.renderers.game_end import render_game_end
-from ..presentation.renderers.rank import render_rank_image
 from ..presentation.renderers.game_detail import render_game_detail_image
 from ..domain.monitoring import MonitorStateStore, StateBackedMonitorMixin, should_skip_game
 from ..shared.fonts import resolve_font_path
@@ -154,6 +154,7 @@ class SteamStatusMonitorV3(
         self.price_query = PriceQueryService(self, translator=self._translate_game_query)
         self.monitor_control = MonitorControlService(self)
         self.player_status_view = PlayerStatusViewService(self)
+        self.rank_view = RankViewService(self)
         self.rank_push_groups = []          # 开启了每日排行榜推送的群列表
         self.rank_push_all = False           # True=全群统一推送全局排行（只渲染一次）
         self._last_rank_push_date = None    # 记录上次推送日期，防止同一天重复推送
@@ -610,85 +611,8 @@ class SteamStatusMonitorV3(
 
     async def _render_daily_rank_file(self, rank_data):
         """补齐排行榜展示信息并渲染为临时图片。"""
-        sid_set = {player["sid"] for player in rank_data}
-        sid_info = {}
-        if sid_set:
-            status_map = await self.fetch_player_statuses_batch(list(sid_set))
-            for sid, info in status_map.items():
-                sid_info[sid] = {
-                    "name": info.get("name") or sid,
-                    "avatar_url": info.get("avatarfull") or info.get("avatar"),
-                }
-
-        yesterday = self._get_day_key(-1)
-        day_data = self.play_records.get(yesterday, {})
-        for player in rank_data:
-            sid = player["sid"]
-            info = sid_info.get(sid, {})
-            player["name"] = self._resolve_bind_name(
-                sid,
-                info.get("name", sid[-8:]),
-            )
-            player["avatar_url"] = info.get("avatar_url")
-            player["top_game_id"] = None
-            if not player["games"]:
-                continue
-            top_name = player["games"][0]["name"]
-            for game_id, game_info in day_data.get(sid, {}).items():
-                if game_info.get("name") == top_name:
-                    player["top_game_id"] = game_id
-                    break
-
-        async def cover_fetcher(gameid):
-            return await self.get_game_cover_url(gameid)
-
-        avatar_frame_paths = {}
-        from ..presentation.renderers.game_start import get_avatar_frame_path, get_avatar_frame_url
-
-        for player in rank_data:
-            sid = player.get("sid", "")
-            if not sid:
-                continue
-            frame_path = await get_avatar_frame_path(
-                self.data_dir,
-                sid,
-                proxy=self.proxy,
-            )
-            if not frame_path:
-                frame_url = await get_avatar_frame_url(sid, proxy=self.proxy)
-                if frame_url:
-                    frame_path = await get_avatar_frame_path(
-                        self.data_dir,
-                        sid,
-                        frame_url,
-                        proxy=self.proxy,
-                    )
-            if frame_path:
-                avatar_frame_paths[sid] = frame_path
-
-        # 排行榜游戏名统一转中文名来源（覆盖插件重启/缓存污染等写入的英文名）
-        for p in rank_data:
-            for g in p.get("games", []):
-                gid = g.get("gameid")
-                if not gid:
-                    continue
-                resolved = await self.get_chinese_game_name(str(gid), g.get("name"))
-                if resolved:
-                    g["name"] = resolved
-
-        font_path = resolve_font_path("NotoSansHans-Regular.otf")
-        img_bytes = await render_rank_image(
-            self.data_dir,
-            rank_data,
-            "昨日",
-            font_path=font_path,
-            proxy=self.proxy,
-            cover_fetcher=cover_fetcher,
-            avatar_frame_paths=avatar_frame_paths,
-        )
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-            tmp.write(img_bytes)
-            return tmp.name
+        await self.rank_view.enrich(rank_data, days=1, base_day_offset=-1)
+        return await self.rank_view.render_file(rank_data, "昨日")
 
     async def _daily_rank_push(self, test_mode=False):
         """推送昨日榜单；默认按目标群独立聚合，显式全局模式才共享总榜。"""
@@ -781,84 +705,14 @@ class SteamStatusMonitorV3(
     async def _render_and_send_rank(self, event, group_id, days, period_label, is_all=False):
         """生成排行榜图片并发送"""
         try:
-            rank_data = self._get_rank_data(days=days, group_id=None if is_all else group_id)
-            if not rank_data:
+            tmp_path = await self.rank_view.render_aggregated(
+                days=days,
+                period_label=period_label,
+                group_id=None if is_all else group_id,
+            )
+            if not tmp_path:
                 yield event.plain_result(f"暂无{period_label}游玩记录，玩家游戏结束后才会有数据。")
                 return
-            # 补充玩家昵称和头像URL
-            sid_set = {p["sid"] for p in rank_data}
-            sid_info = {}
-            if sid_set:
-                status_map = await self.fetch_player_statuses_batch(list(sid_set))
-                for sid, info in status_map.items():
-                    sid_info[sid] = {
-                        "name": info.get("name") or sid,
-                        "avatar_url": info.get("avatarfull") or info.get("avatar")
-                    }
-            for p in rank_data:
-                info = sid_info.get(p["sid"], {})
-                p["name"] = self._resolve_bind_name(p["sid"], info.get("name", p["sid"][-8:]))
-                p["avatar_url"] = info.get("avatar_url")
-                # 标记主玩游戏ID用于封面获取
-                if p["games"]:
-                    # 需要gameid来获取封面，从play_records中反查
-                    p["top_game_id"] = None
-            # 从play_records中反查每个玩家top游戏的gameid
-            for p in rank_data:
-                if not p["games"]:
-                    continue
-                top_name = p["games"][0]["name"]
-                # 在最近数据中找匹配的gameid
-                for di in range(days):
-                    dk = self._get_day_key(-di)
-                    day_data = self.play_records.get(dk, {})
-                    sid_games = day_data.get(p["sid"], {})
-                    for gid, ginfo in sid_games.items():
-                        if ginfo.get("name") == top_name:
-                            p["top_game_id"] = gid
-                            break
-                    if p.get("top_game_id"):
-                        break
-
-            # 封面获取回调
-            async def cover_fetcher(gameid):
-                return await self.get_game_cover_url(gameid)
-
-            # 获取头像框路径
-            avatar_frame_paths = {}
-            from ..presentation.renderers.game_start import get_avatar_frame_url, get_avatar_frame_path
-            for p in rank_data:
-                sid = p.get("sid", "")
-                if sid:
-                    fp = await get_avatar_frame_path(self.data_dir, sid, proxy=self.proxy)
-                    if not fp:
-                        frame_url = await get_avatar_frame_url(sid, proxy=self.proxy)
-                        if frame_url:
-                            fp = await get_avatar_frame_path(self.data_dir, sid, frame_url, proxy=self.proxy)
-                    if fp:
-                        avatar_frame_paths[sid] = fp
-
-            # 排行榜游戏名统一转中文名来源（覆盖插件重启/缓存污染等写入的英文名）
-            for p in rank_data:
-                for g in p.get("games", []):
-                    gid = g.get("gameid")
-                    if not gid:
-                        continue
-                    resolved = await self.get_chinese_game_name(str(gid), g.get("name"))
-                    if resolved:
-                        g["name"] = resolved
-
-            font_path = resolve_font_path('NotoSansHans-Regular.otf')
-            img_bytes = await render_rank_image(
-                self.data_dir, rank_data, period_label,
-                font_path=font_path, proxy=self.proxy,
-                cover_fetcher=cover_fetcher,
-                avatar_frame_paths=avatar_frame_paths
-            )
-            import tempfile
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                tmp.write(img_bytes)
-                tmp_path = tmp.name
             yield event.image_result(tmp_path)
         except Exception as e:
             logger.error(f"[排行榜] 渲染失败: {e}\n{traceback.format_exc()}")
@@ -869,18 +723,7 @@ class SteamStatusMonitorV3(
     async def steam_rank(self, event: AstrMessageEvent, period: str = ""):
         '''查看本群玩家游戏时长排行榜（默认今日，可选 week/month）'''
         group_id = event.get_group_id() or "default"
-        period = period.strip().lower()
-        if period == "week":
-            days, label = 7, "最近7天"
-        elif period == "month":
-            days, label = 30, "最近30天"
-        elif period.isdigit():
-            days = int(period)
-            if days <= 0:
-                days = 1
-            label = f"最近{days}天"
-        else:
-            days, label = 1, "今日"
+        days, label = parse_rank_period(period)
         async for result in self._render_and_send_rank(event, group_id, days, label, is_all=False):
             yield result
 
@@ -888,18 +731,7 @@ class SteamStatusMonitorV3(
     @filter.command("steam allrank")
     async def steam_allrank(self, event: AstrMessageEvent, period: str = ""):
         '''查看所有群玩家游戏时长排行榜（默认今日，可选 week/month）'''
-        period = period.strip().lower()
-        if period == "week":
-            days, label = 7, "最近7天"
-        elif period == "month":
-            days, label = 30, "最近30天"
-        elif period.isdigit():
-            days = int(period)
-            if days <= 0:
-                days = 1
-            label = f"最近{days}天"
-        else:
-            days, label = 1, "今日"
+        days, label = parse_rank_period(period)
         async for result in self._render_and_send_rank(event, None, days, label, is_all=True):
             yield result
 

@@ -40,6 +40,7 @@ class ModularStructureTests(unittest.TestCase):
             "src/application/services/price_query.py",
             "src/application/services/monitor_control.py",
             "src/application/services/player_status_view.py",
+            "src/application/services/rank_view.py",
             "src/domain/monitoring/game_filter.py",
             "src/domain/monitoring/session.py",
             "src/domain/ranking/push_scopes.py",
