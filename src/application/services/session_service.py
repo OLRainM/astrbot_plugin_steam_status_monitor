@@ -281,16 +281,28 @@ class SessionService:
         game_name = meta.get("game_name") or "未知游戏"
         player_name = meta.get("player_name") or session.sid
         duration_min = session.duration_min
-        plugin._record_playtime(session.sid, session.gameid, game_name, duration_min)
-        plugin._record_session(
-            sid=session.sid,
-            gameid=session.gameid,
-            game_name=game_name,
-            start_time=session.started_at,
-            end_time=session.exited_at or session.closed_at,
-            duration_min=duration_min,
-            group_id=session.group_id,
-        )
+        ranking = getattr(plugin, "ranking_service", None)
+        if ranking is not None:
+            ranking.record_closed(
+                session.sid,
+                session.gameid,
+                game_name,
+                session.started_at,
+                session.exited_at or session.closed_at,
+                duration_min,
+                session.group_id,
+            )
+        else:
+            plugin._record_playtime(session.sid, session.gameid, game_name, duration_min)
+            plugin._record_session(
+                sid=session.sid,
+                gameid=session.gameid,
+                game_name=game_name,
+                start_time=session.started_at,
+                end_time=session.exited_at or session.closed_at,
+                duration_min=duration_min,
+                group_id=session.group_id,
+            )
         last_quit = plugin.group_last_quit_times.setdefault(session.group_id, {})
         last_quit.setdefault(session.sid, {})[session.gameid] = int(session.closed_at or session.exited_at or 0)
 

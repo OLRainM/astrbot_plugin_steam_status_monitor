@@ -1,18 +1,20 @@
 from astrbot.api.star import Star, Context
-from ..shared.logging import logger, register_sensitive_values
-from ..shared.network import configure_tls, httpx_client_kwargs, requests_verify
+from ..shared.logging import logger
+from ..shared.network import httpx_client_kwargs, requests_verify
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Plain, Image  # 确保已导入 Image
 import base64
-import json
 import time
 import httpx
 import asyncio
 import os
 import random
 from ..application.services.openbox import handle_openbox
-from ..application.services.steam_list import handle_steam_list
+from ..application.services.steam_list import handle_steam_list, build_player_row
+from ..application.services.monitor_admin import MonitorAdminService
+from ..application.services.ranking import RankingService
+from ..application.services.price_query import PriceQueryService
 import re
 from ..application.services.achievement_monitor import AchievementMonitor
 from ..application.services.achievement_tracking import AchievementTrackingMixin
@@ -23,13 +25,13 @@ from ..application.services.polling_tracking import PollingTrackingMixin
 from ..presentation.renderers.game_start import render_game_start
 from ..presentation.renderers.game_end import render_game_end
 from ..presentation.renderers.rank import render_rank_image
-from ..presentation.renderers.game_detail import COUNTRY_LABEL, render_game_detail_image
+from ..presentation.renderers.game_detail import render_game_detail_image
 from ..domain.monitoring import MonitorStateStore, StateBackedMonitorMixin
 from ..shared.fonts import resolve_font_path
 from ..domain.ranking.push_scopes import build_rank_push_scopes
 from PIL import Image as PILImage
 import io
-from datetime import datetime, timedelta, date
+from datetime import date
 import requests  # 新增导入
 import tempfile
 import traceback
@@ -38,23 +40,11 @@ from ..presentation.web.admin_api import WebAdminAPI
 from ..infrastructure.persistence.plugin_data import PersistenceMixin
 from ..infrastructure.fonts import FontPackService
 from ..infrastructure.clients.steam import SteamClientMixin
-from ..infrastructure.clients.itad import ITADClient
 from ..application.services.qq_menu_management import QQMenuManagementMixin
-from ..shared.paths import ABILITIES_PATH, CONFIG_PATH
-from ..shared.utils.price import (
-    CURRENCY_REGION,
-    extract_price_query,
-    extract_steam_appid,
-    is_store_region_locked,
-    store_region_candidates,
-    summary_to_currency,
-)
+from ..shared.paths import ABILITIES_PATH
+from ..shared.utils.price import extract_price_query, extract_steam_appid
 from ..shared.utils.notify_session import is_sendable_group_session, is_valid_group_id
-
-# 状态文件最后写入距今超过该秒数（默认 60 分钟），视为插件停止期间遗留的陈旧状态。
-# 正常运行时 states.json 约每 5 分钟落盘一次（最慢轮询间隔 30 分钟 + 保存节流 5 分钟），
-# 60 分钟阈值足以安全区分"插件停止过"与"正常运行"。
-_STALE_STATE_THRESHOLD = 3600
+from .runtime_config import apply_hot_update, apply_runtime_config
 
 
 class SteamStatusMonitorV3(
@@ -92,86 +82,10 @@ class SteamStatusMonitorV3(
         self._abilities = None
         self._abilities_path = str(ABILITIES_PATH)
         self._game_name_cache = {}  # 修复: 游戏名缓存，防止 AttributeError
-        # 统一使用 AstrBot 配置系统
-        self.config = config or {}
-        # 兼容旧逻辑，若 config 为空则尝试读取 config.json（可选，建议后续移除）
-        if not self.config:
-            try:
-                config_path = str(CONFIG_PATH)
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    self.config = json.load(f)
-            except Exception as e:
-                logger.error(f"steam_status_monitor 配置读取失败: {e}")
-                self.config = {}
-        # 旧配置迁移：如存在 steam_ids（未分群），迁移到 group_steam_ids['default']
-        if 'steam_ids' in self.config and 'group_steam_ids' not in self.config:
-            steam_ids = self.config.get('steam_ids', [])
-            if isinstance(steam_ids, str):
-                steam_ids = [x.strip() for x in steam_ids.split(',') if x.strip()]
-            self.config['group_steam_ids'] = {'default': steam_ids}
-            self.config.pop('steam_ids', None)
-            logger.info(f"已自动迁移旧 steam_ids 配置到 group_steam_ids['default']")
-        # 读取配置项，提供默认值
-        self.API_KEY = self.config.get('steam_api_key', '')
-        register_sensitive_values(self.API_KEY, self.config.get('sgdb_api_key', ''))
-        self.SSL_CA_FILE = self.config.get('ssl_ca_file', '')
-        try:
-            configure_tls(self.SSL_CA_FILE)
-        except ValueError as exc:
-            logger.error(f"TLS 配置无效，将使用系统默认信任链: {exc}")
-            self.SSL_CA_FILE = ''
-            configure_tls()
-        # API Base URL（支持自定义，默认官方地址）
-        self.STEAM_API_BASE = (self.config.get('steam_api_base', '') or 'https://api.steampowered.com').rstrip('/')
-        self.STEAM_STORE_BASE = (self.config.get('steam_store_base', '') or 'https://store.steampowered.com').rstrip('/')
-        self.SGDB_API_BASE = (self.config.get('sgdb_api_base', '') or 'https://www.steamgriddb.com').rstrip('/')
-        self.group_steam_ids = self.config.get('group_steam_ids', {})
-        self.RETRY_TIMES = self.config.get('retry_times', 3)
-        # 代理支持（来自 PR #16 by Sodiumsss）
-        self.ENABLE_PROXY = self.config.get('enable_proxy', False)
-        self.PROXY_URL = self.config.get('proxy_url', '')
-        self.proxy = self.PROXY_URL if self.ENABLE_PROXY and self.PROXY_URL else None
-        self.ITAD_CLIENT = ITADClient(
-            self.config.get('itad_api_key', ''),
-            proxy=self.proxy,
-            base_url=self.config.get('itad_api_base', ''),
-        )
+        apply_runtime_config(self, config)
         self._steam_search_cache = {}
         self._steam_search_pending = {}
-        # 代理前置校验：若启用 SOCKS 代理但未安装 socksio，尝试自动安装
-        if self.proxy and self.proxy.startswith('socks'):
-            try:
-                import socksio
-            except ImportError:
-                logger.info(f'[SteamStatusMonitor] 检测到 SOCKS 代理 ({self.proxy})，socksio 未安装，尝试自动安装...')
-                import subprocess, sys
-                try:
-                    subprocess.check_call(
-                        [sys.executable, '-m', 'pip', 'install', 'httpx[socks]', '-q'],
-                        timeout=60
-                    )
-                    import socksio
-                    logger.info('[SteamStatusMonitor] socksio 自动安装成功')
-                except Exception as ie:
-                    logger.error(
-                        f'[SteamStatusMonitor] socksio 自动安装失败: {ie}。'
-                        f'请手动执行: pip install httpx[socks]'
-                    )
-        self.max_group_size = self.config.get('max_group_size', 20)
-        self.GROUP_ID = None  # 当前操作群号，指令时动态赋值
-        self.fixed_poll_interval = self.config.get('fixed_poll_interval', 0)  # 新增：固定轮询间隔，0为智能轮询
-        self.poll_interval_mid_sec = self.config.get('poll_interval_mid_sec', 600)  # 10分钟
-        self.poll_interval_long_sec = self.config.get('poll_interval_long_sec', 1800)  # 30分钟
         self.next_poll_time = {}  # {group_id: {steamid: next_time}}
-        self.detailed_poll_log = self.config.get('detailed_poll_log', True)
-        # 新增：智能轮询间隔配置 [游戏中, 12分钟内, 12分钟~3小时, 3小时~24小时, 24~48小时, 超过48小时]
-        raw_intervals = self.config.get('smart_poll_intervals', "1,3,5,10,20,30")
-        if isinstance(raw_intervals, str):
-            self.smart_poll_intervals = [int(x.strip()) for x in raw_intervals.split(",") if x.strip()]
-        else:
-            self.smart_poll_intervals = list(raw_intervals)
-        # 归一化回字符串写入 config，防止 WebUI schema 校验类型错误
-        self.config['smart_poll_intervals'] = ",".join(str(x) for x in self.smart_poll_intervals)
         # 数据持久化目录
         self.data_dir = os.path.join("data", "steam_status_monitor")
         os.makedirs(self.data_dir, exist_ok=True)
@@ -193,7 +107,6 @@ class SteamStatusMonitorV3(
             self._achievement_blacklist_verify_task = asyncio.create_task(
                 self.achievement_monitor.verify_blacklist_once()
             )
-        self.max_achievement_notifications = self.config.get('max_achievement_notifications', 5)
         self.achievement_poll_tasks = {}  # {(group_id, sid, gameid): asyncio.Task}
         self.achievement_snapshots = {}   # {(group_id, sid, gameid): [成就列表]}
         self.achievement_blacklist = set()  # 新增：成就查询黑名单
@@ -225,18 +138,16 @@ class SteamStatusMonitorV3(
         # 保存任务引用，便于 terminate 时取消，防止重载/禁用后残留多实例并发
         self._poll_loop_task = asyncio.create_task(self.global_poll_and_log_loop())
         self._init_poll_task = asyncio.create_task(self.init_poll_time_once())
-        # SGDB API Key 可在 https://www.steamgriddb.com/profile/preferences/api 获取
-        self.SGDB_API_KEY = self.config.get('sgdb_api_key', '')
         self._load_push_groups()  # <--- 修复：确保push_groups属性初始化
         # --- 排行榜功能：游玩时长记录 + 去重缓存 + 每日推送开关 ---
         self.play_records = {}              # {date_str: {steamid: {gameid: {name, minutes}}}}
         self.session_records = {}           # {steamid: [session_dict]} 甘特图/热力图数据
         self._session_dirty = False         # session 数据脏标志
         self._recorded_quit_cache = {}      # {(steamid, gameid): timestamp} 去重用
+        self.ranking_service = RankingService(self)
+        self.price_query = PriceQueryService(self, translator=self._translate_game_query)
         self.rank_push_groups = []          # 开启了每日排行榜推送的群列表
         self.rank_push_all = False           # True=全群统一推送全局排行（只渲染一次）
-        self.rank_push_hour = self.config.get('rank_push_hour', 8)
-        self.rank_push_minute = self.config.get('rank_push_minute', 30)
         self._last_rank_push_date = None    # 记录上次推送日期，防止同一天重复推送
         self._load_play_records()
         self._load_session_records()
@@ -250,23 +161,6 @@ class SteamStatusMonitorV3(
         self.web_api = WebAdminAPI(self)
         self.web_api.register_routes(context)
         logger.info("[WebAdmin] 管理页面已注册到 AstrBot 内置 WebUI")
-
-    def _is_group_state_stale(self, group_id, threshold=_STALE_STATE_THRESHOLD):
-        """判断该群状态缓存是否为插件停止期间遗留的旧数据。
-
-        依据：states.json 最后写入时间早于本次插件启动，且距今超过阈值（默认 60 分钟）。
-        正常运行时 states.json 约每 5 分钟落盘一次（mtime 持续刷新）；插件停止后 mtime
-        停在停止时刻。重启后首次初始化期间用它识别"停止期间累积的历史变化"，跳过播报。
-        """
-        try:
-            path = self._get_group_data_path(group_id, "states")
-            if not os.path.exists(path):
-                return False  # 无缓存文件，无从判断，视为正常
-            mtime = os.path.getmtime(path)
-            return mtime < self._startup_time and (time.time() - mtime) > threshold
-        except Exception as e:
-            logger.warning(f"[陈旧状态] 判断 states 新鲜度失败: {e} (group_id={group_id})")
-            return False
 
     async def terminate(self):
         '''插件被卸载/停用时取消所有后台任务并保存持久化数据'''
@@ -387,17 +281,14 @@ class SteamStatusMonitorV3(
         if not is_valid_group_id(group_id):
             yield event.plain_result("请在群聊中使用该命令，或到 WebUI 填写有效群号后再添加。")
             return
-        # 解析 @用户 [备注名] 后缀（多参数接收，兼容 AstrBot 参数分割）
         bind_qq = None
         bind_nickname = None
         if at_user:
-                        m = re.search(r'\[CQ:at,qq=(\d+)\]|\[At:(\d+)\]|@.+?\((\d+)\)|@(\d+)', at_user.strip()); bind_qq = m.group(1) or m.group(2) or m.group(3) or m.group(4) if m else None
+            m = re.search(r'\[CQ:at,qq=(\d+)\]|\[At:(\d+)\]|@.+?\((\d+)\)|@(\d+)', at_user.strip())
+            bind_qq = (m.group(1) or m.group(2) or m.group(3) or m.group(4)) if m else None
         if nickname:
             bind_nickname = nickname.strip()
-        # 仅以中英文逗号分隔多个 ID
-        import re as _re
-        raw_list = [x.strip() for x in _re.split(r'[,，]+', steamid) if x.strip()]
-        # 逐个解析为 SteamID64（支持 URL / 自定义 ID / 好友码 / 纯数字）
+        raw_list = [x.strip() for x in re.split(r'[,，]+', steamid) if x.strip()]
         resolved_list = []
         invalid_list = []
         for raw in raw_list:
@@ -412,14 +303,13 @@ class SteamStatusMonitorV3(
                 f"支持格式：17位SteamID64 / 个人资料链接 / 自定义ID链接 / 8位好友码"
             )
             return
-        # 去重
         seen = set()
         steamid_list = []
         for sid in resolved_list:
             if sid not in seen:
                 seen.add(sid)
                 steamid_list.append(sid)
-        steam_ids = self.group_steam_ids.setdefault(group_id, [])
+        admin = MonitorAdminService(self)
         added = []
         pushed = []
         already = []
@@ -428,56 +318,28 @@ class SteamStatusMonitorV3(
         pushed_primary_groups = {}
         limit = self.max_group_size
         for sid in steamid_list:
-            if sid in steam_ids:
+            result = admin.add_player(group_id, sid)
+            if result.message == "already exists":
                 already.append(sid)
-                # 已在本群监控：若本次携带绑定/备注，仍允许更新（不直接跳过）
                 if bind_qq or bind_nickname:
                     binding_updated.append(sid)
                 continue
-            primary_group = next(
-                (
-                    candidate
-                    for candidate, candidate_ids in self.group_steam_ids.items()
-                    if candidate != group_id and sid in candidate_ids
-                ),
-                None,
-            )
-            if primary_group is not None:
-                targets = self.push_groups.setdefault(sid, [])
-                pushed_primary_groups[sid] = primary_group
-                if group_id in targets:
-                    already_pushed.append(sid)
-                else:
-                    targets.append(group_id)
-                    pushed.append(sid)
+            if result.message == "already push group":
+                already_pushed.append(sid)
+                pushed_primary_groups[sid] = admin.primary_group_of(sid)
                 continue
-            if len(steam_ids) < limit:
-                steam_ids.append(sid)
+            if result.message == "added as push group":
+                pushed.append(sid)
+                pushed_primary_groups[sid] = admin.primary_group_of(sid)
+                continue
+            if result.message == "added as primary monitor":
                 added.append(sid)
-            else:
+                continue
+            if "group limit reached" in result.message:
                 break
-        self.group_steam_ids[group_id] = steam_ids
-        if added:
-            self._save_group_steam_ids()
-        if pushed:
-            self._save_push_groups()
-        # 绑定数据：写入并保存（已在本群监控的ID同样允许更新备注/绑定）
         if steamid_list and (bind_qq or bind_nickname):
-            if not hasattr(self, '_bind_data'):
-                self._bind_data = {}
             for sid in steamid_list:
-                if bind_qq:
-                    self._bind_data[bind_qq] = {"sid": sid, "nickname": bind_nickname or "*"}
-                elif bind_nickname:
-                    # 未解析到QQ：更新该SteamID已有绑定记录的备注，无记录则以 sid 为键新增
-                    matched = False
-                    for _key, _info in list(self._bind_data.items()):
-                        if _info.get("sid") == str(sid):
-                            self._bind_data[_key]["nickname"] = bind_nickname
-                            matched = True
-                    if not matched:
-                        self._bind_data[f"__remark:{sid}"] = {"sid": sid, "nickname": bind_nickname}
-            self._save_bind_data()
+                admin.bind_player(sid, qq=bind_qq, nickname=bind_nickname)
             logger.info(f"[绑定] {'QQ'+str(bind_qq) if bind_qq else '备注'} -> SteamID {steamid_list[-1]}，备注={bind_nickname or '无'}")
         msg = ""
         if added:
@@ -555,17 +417,13 @@ class SteamStatusMonitorV3(
         if not appid.isdigit():
             yield event.plain_result("用法：/steam game <Steam AppID>")
             return
-        price_currency = (self.config.get("price_currency", "CNY") or "CNY").strip().upper() or "CNY"
-        price_region = (self.config.get("price_region", "") or "").strip().upper()
-        if not price_region:
-            price_region = CURRENCY_REGION.get(price_currency, "CN")
-        game = await self.fetch_game_details(appid, country=price_region)
-        if not game:
+        card = await self.price_query.build_store_card(appid)
+        if not card or not card.detail:
             yield event.plain_result(f"未找到 Steam 游戏 AppID：{appid}，或 Steam 商店暂时无法访问。")
             return
         try:
             img_bytes = await render_game_detail_image(
-                game,
+                card.card_data,
                 font_path=resolve_font_path("NotoSansHans-Regular.otf"),
                 proxy=self.proxy,
             )
@@ -670,20 +528,14 @@ class SteamStatusMonitorV3(
                 yield event.plain_result("候选序号无效，请重新回复序号。")
                 return
         else:
-            url_appid = extract_steam_appid(query)
-            if url_appid:
-                game = await self.ITAD_CLIENT.lookup_steam_appid(url_appid)
-                if game is None:
+            games = await self.price_query.resolve_games(query)
+            if not games:
+                if extract_steam_appid(query):
                     yield event.plain_result("未能通过该商店链接查到 ITAD 价格，请改用游戏名查询。")
-                    return
-                games = [game]
-            else:
-                search_query = await self._translate_game_query(query)
-                games = await self.ITAD_CLIENT.search_games(search_query)
-                if not games:
+                else:
                     yield event.plain_result("未找到匹配游戏，或 ITAD 暂时无法访问。")
-                    return
-                game = games[0]
+                return
+            game = games[0]
         if not auto_first and not selected_from_cache and len(games) > 1:
             self._steam_search_cache[session_key] = games
             self._steam_search_pending[session_key] = True
@@ -692,74 +544,16 @@ class SteamStatusMonitorV3(
                 lines.append(f"{index}. {game.title}")
             yield event.plain_result("\n".join(lines))
             return
-        price_currency = (self.config.get("price_currency", "CNY") or "CNY").strip().upper() or "CNY"
-        price_region = (self.config.get("price_region", "") or "").strip().upper()
-        if not price_region:
-            price_region = CURRENCY_REGION.get(price_currency, "CN")
-        compare_region_raw = (self.config.get("price_compare_regions", "UA") or "NONE").strip()
-        # 兼容旧配置：price_compare_regions 此前为逗号分隔（如 "CN,US"），此处取第一个作为单选对比区
-        compare_region = compare_region_raw.split(",")[0].strip().upper()
-        region_codes = [price_region]
-        if compare_region and compare_region != "NONE" and compare_region != price_region:
-            region_codes.append(compare_region)
-        # 主区史低/兜底仍由 ITAD 提供；地区对比行改用 Steam 商店各国家区价（cc=<国家>），
-        # 再统一折算为主货币显示与比较（与参考插件一致，UA 区即 Steam 商店价）
-        summary = await self.ITAD_CLIENT.get_price_summary(game.id, price_region) or {}
-        if summary.get("current_price") is None:
-            for fallback_region in store_region_candidates(price_region)[1:]:
-                fallback_summary = await self.ITAD_CLIENT.get_price_summary(game.id, fallback_region) or {}
-                if fallback_summary.get("current_price") is not None:
-                    logger.info(
-                        "ITAD %s 区无价格，改用 %s 区 (game=%s)",
-                        price_region,
-                        fallback_region,
-                        game.id,
-                    )
-                    summary = fallback_summary
-                    break
-        region_prices = {}
-        if game.appid:
-            region_summaries = await asyncio.gather(
-                *[self.fetch_region_price(game.appid, region) for region in region_codes]
-            )
-            for code, region_summary in zip(region_codes, region_summaries):
-                if not region_summary:
-                    continue
-                actual = str(region_summary.get("region") or code).upper()
-                region_prices[actual] = summary_to_currency(region_summary, price_currency)
-        detail = await self.fetch_game_details(game.appid, country=price_region) if game.appid else None
-        reviews = await self.fetch_game_reviews_both(game.appid) if game.appid else None
-        if detail:
-            detail['review_all'] = (reviews or {}).get('all') or {}
-            detail['review_schinese'] = (reviews or {}).get('schinese') or {}
+        card = await self.price_query.build_card(game)
         self._steam_search_pending.pop(session_key, None)
         self._steam_search_cache.pop(session_key, None)
-        store_appid = (detail or {}).get('store_appid') or game.appid
-        store_url = f"https://store.steampowered.com/app/{store_appid}/" if store_appid else ""
-        store_message = store_url
-        actual_store_region = str((detail or {}).get("_store_region") or "").upper()
-        if store_url and is_store_region_locked(price_region, actual_store_region, region_prices):
-            region_label = COUNTRY_LABEL.get(price_region, price_region)
-            store_message = f"{store_url}\n当前游戏锁{region_label}"
-
-        card_data = detail or {
-            'name': game.title,
-            'header_image': game.image,
-            'short_description': '由 ITAD 提供当前价格与历史最低价信息。',
-            'genres': [],
-            'developers': [],
-            'release_date': {'date': '未知'},
-            'price_overview': {},
-            'review_all': (reviews or {}).get('all') or {},
-            'review_schinese': (reviews or {}).get('schinese') or {},
-        }
         try:
             img_bytes = await render_game_detail_image(
-                card_data,
+                card.card_data,
                 font_path=resolve_font_path("NotoSansHans-Regular.otf"),
                 proxy=self.proxy,
-                itad_summary=summary,
-                region_prices=region_prices,
+                itad_summary=card.summary,
+                region_prices=card.region_prices,
             )
             with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
                 tmp.write(img_bytes)
@@ -767,15 +561,15 @@ class SteamStatusMonitorV3(
             with open(image_path, "rb") as image_file:
                 image_base64 = base64.b64encode(image_file.read()).decode("ascii")
             result = event.make_result().base64_image(image_base64)
-            if store_message:
-                result.message(store_message)
+            if card.store_message:
+                result.message(card.store_message)
             yield result
             return
         except Exception as exc:
             logger.exception("渲染 Steam 价格详情卡片失败: %s", exc)
 
-        if store_message:
-            yield event.plain_result(store_message)
+        if card.store_message:
+            yield event.plain_result(card.store_message)
         else:
             yield event.plain_result("未找到对应的 Steam 商店链接。")
 
@@ -838,46 +632,8 @@ class SteamStatusMonitorV3(
     @filter.command("steam set")
     async def steam_set(self, event: AstrMessageEvent, key: str, value: str):
         '''设置配置参数，立即生效（如 steam set fixed_poll_interval 600）'''
-        if key not in self.config:
-            yield event.plain_result(f"无效参数: {key}")
-            return
-        old = self.config[key]
-        if key == "smart_poll_intervals":
-            # 支持字符串输入
-            value_list = [int(x.strip()) for x in value.split(",") if x.strip()]
-            value = ",".join(str(x) for x in value_list)
-            self.smart_poll_intervals = value_list
-        elif isinstance(old, int):
-            try:
-                value = int(value)
-            except Exception:
-                yield event.plain_result("类型错误，应为整数")
-                return
-        elif isinstance(old, float):
-            try:
-                value = float(value)
-            except Exception:
-                yield event.plain_result("类型错误，应为浮点数")
-                return
-        elif isinstance(old, list):
-            # 兼容旧格式
-            value = [int(x.strip()) for x in value.split(",") if x.strip()]
-        self.config[key] = value
-        # 同步到属性
-        self.API_KEY = self.config.get('steam_api_key', '')
-        self.STEAM_IDS = self.config.get('steam_ids', [])
-        self.RETRY_TIMES = self.config.get('retry_times', 3)
-        self.GROUP_ID = self.config.get('notify_group_id', None)
-        self.fixed_poll_interval = self.config.get('fixed_poll_interval', 0)
-        # 重新解析智能轮询间隔
-        raw_intervals = self.config.get('smart_poll_intervals', "1,3,5,10,20,30")
-        if isinstance(raw_intervals, str):
-            self.smart_poll_intervals = [int(x.strip()) for x in raw_intervals.split(",") if x.strip()]
-        else:
-            self.smart_poll_intervals = list(raw_intervals)
-        if hasattr(self.config, "save_config"):
-            self.config.save_config()
-        yield event.plain_result(f"已设置 {key} = {value}")
+        ok, msg = apply_hot_update(self, key, value)
+        yield event.plain_result(msg)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("steam rs")
@@ -1336,27 +1092,18 @@ class SteamStatusMonitorV3(
         name = self._resolve_bind_name(sid, status.get('name') or sid)
         gameid = status.get('gameid')
         game = status.get('gameextrainfo')
-        personastate = status.get('personastate', 0)
-        avatar_url = status.get('avatarfull') or status.get('avatar') or ''
-        lastlogoff = status.get('lastlogoff')
         zh_game_name = await self.get_chinese_game_name(gameid, game) if gameid else (game or '')
-        # 构建单人 user_list
         now = int(time.time())
         group_id = str(event.get_group_id()) if hasattr(event, 'get_group_id') else 'default'
-        if gameid:
-            start_time = self.session_service.started_at(group_id, sid, gameid)
-            play_seconds = now - start_time if start_time else 0
-            play_minutes = play_seconds / 60
-            play_str = f"{play_minutes/60:.1f}小时" if play_minutes >= 60 else f"{play_minutes:.1f}分钟"
-            user_list = [{'sid': sid, 'name': name, 'status': 'playing', 'avatar_url': avatar_url, 'game': zh_game_name, 'gameid': gameid, 'play_str': play_str, 'lastlogoff': lastlogoff}]
-        elif personastate and int(personastate) > 0:
-            _persona_status = {0: 'offline', 1: 'online', 2: 'busy', 3: 'away', 4: 'snooze'}
-            p_status = _persona_status.get(int(personastate), 'online')
-            user_list = [{'sid': sid, 'name': name, 'status': p_status, 'avatar_url': avatar_url, 'game': '', 'gameid': '', 'play_str': '', 'lastlogoff': lastlogoff}]
-        else:
-            hours_ago = (now - int(lastlogoff)) / 3600 if lastlogoff else 0
-            play_str = f"上次在线 {hours_ago:.1f}小时前" if lastlogoff else ''
-            user_list = [{'sid': sid, 'name': name, 'status': 'offline', 'avatar_url': avatar_url, 'game': '', 'gameid': '', 'play_str': play_str, 'lastlogoff': lastlogoff}]
+        start_time = self.session_service.started_at(group_id, sid, gameid) if gameid else None
+        user_list = [build_player_row(
+            sid,
+            status,
+            name=name,
+            zh_game_name=zh_game_name,
+            start_time=start_time,
+            now=now,
+        )]
         # 获取头像框
         from ..presentation.renderers.game_start import get_avatar_frame_url, get_avatar_frame_path
         avatar_frame_paths = {}
@@ -1713,124 +1460,21 @@ class SteamStatusMonitorV3(
         return False
 
     def _get_day_key(self, offset_days=0):
-        """基于凌晨4:00边界的日期键
-        offset_days=0: 当前所处"天"的日期键
-        offset_days=-1: 前一天的日期键
-        """
-        now = datetime.now()
-        if now.hour < 4:
-            now = now - timedelta(days=1)
-        now = now + timedelta(days=offset_days)
-        return now.strftime("%Y-%m-%d")
+        """基于凌晨4:00边界的日期键。"""
+        return self.ranking_service.day_key(offset_days)
 
     def _get_rank_data(self, days=1, group_id=None, base_day_offset=0):
-        """聚合游玩时长数据，返回已排序的排行榜列表
-        Args:
-            days: 1=今日, 7=最近7天, 30=最近30天
-            group_id: 指定群则只统计该群的SteamID，None则统计全部
-        Returns:
-            [{sid, name, total_minutes, games: [{name, minutes}]}] 按总时长降序
-        """
-        try:
-            today_str = self._get_day_key(base_day_offset)
-            base_date = datetime.strptime(today_str, "%Y-%m-%d")
-            date_keys = []
-            for i in range(days):
-                d = base_date - timedelta(days=i)
-                date_keys.append(d.strftime("%Y-%m-%d"))
-            # 确定要统计的 SteamID 集合
-            if group_id:
-                # 主监控ID
-                direct_steam_ids = self.group_steam_ids.get(group_id, [])
-                # 子群推送ID（从 push_groups 中查找推送到该群的 SteamID）
-                push_steam_ids = [
-                    sid
-                    for sid, push_targets in (getattr(self, 'push_groups', {}) or {}).items()
-                    if group_id in {str(target) for target in push_targets}
-                ]
-                target_sids = set(direct_steam_ids) | set(push_steam_ids)
-            else:
-                target_sids = set()
-                for gids in self.group_steam_ids.values():
-                    target_sids.update(gids)
-            if not target_sids:
-                return []
-            # 聚合
-            merged = {}  # {sid: {gameid: {name, minutes}}}
-            for date_key in date_keys:
-                day_data = self.play_records.get(date_key, {})
-                for sid, games in day_data.items():
-                    if sid not in target_sids:
-                        continue
-                    if sid not in merged:
-                        merged[sid] = {}
-                    for gid, info in games.items():
-                        # 防御性清洗：name 可能被缓存污染为 tuple/list
-                        raw_name = info.get("name", "未知游戏")
-                        if isinstance(raw_name, (tuple, list)):
-                            raw_name = raw_name[0] if raw_name else "未知游戏"
-                        raw_name = str(raw_name) if raw_name else "未知游戏"
-                        if gid not in merged[sid]:
-                            merged[sid][gid] = {"name": raw_name, "minutes": 0}
-                        merged[sid][gid]["minutes"] += info.get("minutes", 0)
-                        merged[sid][gid]["name"] = info.get("name", merged[sid][gid]["name"])
-            # 构建排行榜列表
-            rank_list = []
-            for sid, games in merged.items():
-                total = sum(g["minutes"] for g in games.values())
-                if total <= 0:
-                    continue
-                game_list = sorted(
-                    [{"name": g["name"], "minutes": g["minutes"], "gameid": gid} for gid, g in games.items()],
-                    key=lambda x: x["minutes"],
-                    reverse=True
-                )
-                rank_list.append({
-                    "sid": sid,
-                    "name": game_list[0]["name"] if game_list else sid,  # 临时用游戏名占位，后续替换为玩家名
-                    "total_minutes": total,
-                    "games": game_list
-                })
-            rank_list.sort(key=lambda x: x["total_minutes"], reverse=True)
-            return rank_list
-        except Exception as e:
-            logger.error(f"[排行榜] 聚合数据异常: {e}")
-            return []
+        """聚合游玩时长数据，返回已排序的排行榜列表。"""
+        ranking = self.ranking_service
+        return ranking.aggregate(
+            days=days,
+            sids=ranking.target_sids(group_id),
+            base_day_offset=base_day_offset,
+        )
 
     def _record_playtime(self, sid, gameid, game_name, duration_min):
         """记录游玩时长到 play_records，带5分钟去重（防止多群重复记录）"""
-        try:
-            if duration_min <= 0 or not gameid:
-                return
-            # 防御性清洗：确保 game_name 是字符串（可能被缓存污染为 tuple/list）
-            if isinstance(game_name, (tuple, list)):
-                game_name = game_name[0] if game_name else "未知游戏"
-            game_name = str(game_name) if game_name else "未知游戏"
-            cache_key = (str(sid), str(gameid))
-            now = time.time()
-            last_ts = self._recorded_quit_cache.get(cache_key, 0)
-            if now - last_ts < 300:
-                logger.debug(f"[排行榜] 去重跳过: {sid} {game_name} (上次记录{int(now-last_ts)}秒前)")
-                return
-            self._recorded_quit_cache[cache_key] = now
-            today_key = self._get_day_key(0)
-            if today_key not in self.play_records:
-                self.play_records[today_key] = {}
-            if str(sid) not in self.play_records[today_key]:
-                self.play_records[today_key][str(sid)] = {}
-            gid = str(gameid)
-            if gid not in self.play_records[today_key][str(sid)]:
-                self.play_records[today_key][str(sid)][gid] = {"name": game_name, "minutes": 0}
-            self.play_records[today_key][str(sid)][gid]["minutes"] += int(duration_min)
-            self.play_records[today_key][str(sid)][gid]["name"] = game_name
-            self._data_dirty = True
-            logger.info(f"[排行榜] 记录游玩时长: {sid} {game_name} +{int(duration_min)}分钟")
-            # 清理过期的去重缓存（超过10分钟）
-            expired = [k for k, v in self._recorded_quit_cache.items() if now - v > 600]
-            for k in expired:
-                self._recorded_quit_cache.pop(k, None)
-        except Exception as e:
-            logger.error(f"[排行榜] 记录游玩时长异常: {e}")
+        self.ranking_service.record_playtime(sid, gameid, game_name, duration_min)
 
     async def get_game_online_count(self, gameid):
         '''通过 Steam Web API 获取当前游戏在线人数'''
@@ -1861,12 +1505,10 @@ class SteamStatusMonitorV3(
     @filter.command("steam alllist")
     async def steam_alllist(self, event: AstrMessageEvent, mode: str = "img"):
         '''所有群聊玩家状态（默认图片，steam alllist text 输出文本）'''
-        _persona_status = {0: 'offline', 1: 'online', 2: 'busy', 3: 'away', 4: 'snooze'}
         from ..presentation.renderers.steam_list import render_steam_list_image
         from ..presentation.renderers.game_start import get_avatar_frame_url, get_avatar_frame_path
         user_list = []
         now = int(time.time())
-        # 收集所有SteamID并批量查询，减少API调用
         all_sids = []
         for gid_ in self.group_steam_ids:
             all_sids.extend(self.group_steam_ids[gid_])
@@ -1878,28 +1520,21 @@ class SteamStatusMonitorV3(
                 sl = int(nt - now)
                 p_str = f"下次轮询{sl}秒后" if sl < 60 else f"下次轮询{sl//60}分钟后"
                 status = status_map.get(sid)
-                if not status:
-                    user_list.append({'sid': sid, 'name': self._resolve_bind_name(sid, sid), 'status': 'error', 'avatar_url': '', 'game': '', 'gameid': '', 'play_str': '获取失败', 'group_id': group_id, 'poll_str': p_str})
-                    continue
-                name = status.get('name') or sid
-                gameid = status.get('gameid')
-                game = status.get('gameextrainfo')
-                avatar_url = status.get('avatarfull') or status.get('avatar') or ''
+                name = self._resolve_bind_name(sid, (status or {}).get("name") or sid)
+                gameid = (status or {}).get("gameid")
+                game = (status or {}).get("gameextrainfo")
                 zh_game_name = await self.get_chinese_game_name(gameid, game) if gameid else (game or "未知游戏")
-                if gameid:
-                    st = self.session_service.started_at(group_id, sid, gameid)
-                    ps = now - st if st else 0
-                    pm = ps / 60
-                    ps_str = f"{pm:.1f}分钟" if pm < 60 else f"{pm/60:.1f}小时"
-                    user_list.append({'sid': sid, 'name': name, 'status': 'playing', 'avatar_url': avatar_url, 'game': zh_game_name, 'gameid': gameid, 'play_str': ps_str, 'group_id': group_id, 'poll_str': p_str})
-                elif status.get('personastate', 0) > 0:
-                    p_status = _persona_status.get(status.get('personastate', 0), 'online')
-                    user_list.append({'sid': sid, 'name': name, 'status': p_status, 'avatar_url': avatar_url, 'game': '', 'gameid': '', 'play_str': '', 'group_id': group_id, 'poll_str': p_str})
-                elif status.get('lastlogoff'):
-                    ha = (now - int(status['lastlogoff'])) / 3600
-                    user_list.append({'sid': sid, 'name': name, 'status': 'offline', 'avatar_url': avatar_url, 'game': '', 'gameid': '', 'play_str': f"上次在线 {ha:.1f} 小时前", 'group_id': group_id, 'poll_str': p_str})
-                else:
-                    user_list.append({'sid': sid, 'name': name, 'status': 'offline', 'avatar_url': avatar_url, 'game': '', 'gameid': '', 'play_str': '', 'group_id': group_id, 'poll_str': p_str})
+                start_time = self.session_service.started_at(group_id, sid, gameid) if gameid else None
+                user_list.append(build_player_row(
+                    sid,
+                    status,
+                    name=name,
+                    zh_game_name=zh_game_name,
+                    start_time=start_time,
+                    now=now,
+                    group_id=group_id,
+                    poll_str=p_str,
+                ))
         # 纯文本输出模式
         if mode.lower() == 'text':
             from ..presentation.renderers.steam_list import get_status_text

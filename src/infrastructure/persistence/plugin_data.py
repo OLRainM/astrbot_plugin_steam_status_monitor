@@ -10,11 +10,25 @@ from ...shared.utils.notify_session import (
     is_valid_group_id,
 )
 
+_STALE_STATE_THRESHOLD = 3600
+
 
 class PersistenceMixin:
     def _get_group_data_path(self, group_id, key):
         """获取分群数据文件路径"""
         return os.path.join(self.data_dir, f"group_{group_id}_{key}.json")
+
+    def _is_group_state_stale(self, group_id, threshold=_STALE_STATE_THRESHOLD):
+        """判断该群状态缓存是否为插件停止期间遗留的旧数据。"""
+        try:
+            path = self._get_group_data_path(group_id, "states")
+            if not os.path.exists(path):
+                return False
+            mtime = os.path.getmtime(path)
+            return mtime < self._startup_time and (time.time() - mtime) > threshold
+        except Exception as e:
+            logger.warning(f"[陈旧状态] 判断 states 新鲜度失败: {e} (group_id={group_id})")
+            return False
 
     def _load_persistent_data(self):
         # 分群加载各群的状态数据
@@ -378,6 +392,10 @@ class PersistenceMixin:
 
     def _record_session(self, sid, gameid, game_name, start_time, end_time, duration_min, group_id):
         """记录单次游玩 session（在游戏退出确认后调用）。"""
+        ranking = getattr(self, "ranking_service", None)
+        if ranking is not None:
+            ranking.record_session(sid, gameid, game_name, start_time, end_time, duration_min, group_id)
+            return
         if duration_min <= 0 or not gameid:
             return
         date_str = self._get_day_key(0)

@@ -30,6 +30,12 @@ class PluginStub:
     def _save_bind_data(self):
         self.bind_data_saves += 1
 
+    def _save_notify_session(self):
+        return None
+
+    def _save_group_switches(self):
+        return None
+
     @property
     def session_service(self):
         class _Stub:
@@ -134,6 +140,24 @@ def test_remove_player_from_push_group_keeps_primary_monitor():
     assert result.message == "removed push route"
     assert plugin.group_steam_ids == {"111": [sid], "222": []}
     assert plugin.push_groups[sid] == ["333"]
+
+
+def test_bind_player_writes_qq_and_remark_records():
+    sid = "76561198000000001"
+    plugin = PluginStub({"111": [sid]})
+    service = MonitorAdminService(plugin)
+
+    assert service.bind_player(sid, qq="10001", nickname="猫") is True
+    assert plugin._bind_data["10001"] == {"sid": sid, "nickname": "猫"}
+    assert plugin.bind_data_saves == 1
+
+    assert service.bind_player(sid, nickname="备注名") is True
+    assert plugin._bind_data["10001"]["nickname"] == "备注名"
+    assert plugin.bind_data_saves == 2
+
+    other = "76561198000000002"
+    assert service.bind_player(other, nickname="路人") is True
+    assert plugin._bind_data[f"__remark:{other}"] == {"sid": other, "nickname": "路人"}
 
 
 def test_remove_player_from_primary_removes_all_routes_and_runtime_state():

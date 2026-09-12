@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ...domain.monitoring import MonitorStateStore
 from ...shared.utils.notify_session import is_valid_group_id
@@ -64,6 +64,29 @@ class MonitorAdminService:
         steam_ids.append(steam_id)
         self._plugin._save_group_steam_ids()
         return GroupMutationResult(True, "added as primary monitor")
+
+    def primary_group_of(self, steam_id: str) -> Optional[str]:
+        return next(
+            (group_id for group_id, steam_ids in self.groups.items() if steam_id in steam_ids),
+            None,
+        )
+
+    def bind_player(self, steam_id: str, qq: Optional[str] = None, nickname: Optional[str] = None) -> bool:
+        if not qq and not nickname:
+            return False
+        bindings = self.bindings
+        if qq:
+            bindings[qq] = {"sid": str(steam_id), "nickname": nickname or "*"}
+        else:
+            matched = False
+            for key, info in list(bindings.items()):
+                if str(info.get("sid")) == str(steam_id):
+                    bindings[key]["nickname"] = nickname
+                    matched = True
+            if not matched:
+                bindings[f"__remark:{steam_id}"] = {"sid": str(steam_id), "nickname": nickname}
+        self._plugin._save_bind_data()
+        return True
 
     def remove_player(self, group_id: str, steam_id: str) -> GroupMutationResult:
         """删除当前群关系：分发群只移除自身路由，主群删除全局主监控与路由。"""
