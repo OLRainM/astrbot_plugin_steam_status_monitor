@@ -1,4 +1,5 @@
 import asyncio
+from collections import defaultdict
 from typing import Any, Dict, Optional, Tuple
 
 from ...domain.monitoring.game_filter import should_skip_game
@@ -14,6 +15,7 @@ class SessionService:
 
     def __init__(self, plugin):
         self._plugin = plugin
+        self._locks: Dict[SessionKey, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     def get(self, group_id, sid) -> Optional[PlayingSession]:
         return self._sessions().get(self._key(group_id, sid))
@@ -38,39 +40,40 @@ class SessionService:
         skip_push=False,
     ):
         key = self._key(group_id, sid)
-        current = self._sessions().get(key)
-        snapshot = {"steamid": str(sid), "group_id": str(group_id), "gameid": observed_gameid}
-        next_session, events = apply(
-            current,
-            snapshot,
-            int(now),
-            sid=str(sid),
-            group_id=str(group_id),
-        )
-        self._store(group_id, sid, next_session)
-        for event in events:
-            await self._dispatch(
-                event,
-                player_name=player_name,
-                current_game_name=current_game_name,
-                status=status,
-                skip_push=skip_push,
+        async with self._locks[key]:
+            current = self._sessions().get(key)
+            snapshot = {"steamid": str(sid), "group_id": str(group_id), "gameid": observed_gameid}
+            next_session, events = apply(
+                current,
+                snapshot,
+                int(now),
+                sid=str(sid),
+                group_id=str(group_id),
             )
-        if (
-            next_session is not None
-            and next_session.state == "playing"
-            and not skip_push
-        ):
-            await self._ensure_achievement_poll(
-                next_session,
-                player_name=player_name,
-                game_name=current_game_name,
-            )
-        if events:
-            self._plugin._data_dirty = True
-        return next_session, events
+            self._store(group_id, sid, next_session)
+            for event in events:
+                await self._dispatch(
+                    event,
+                    player_name=player_name,
+                    current_game_name=current_game_name,
+                    status=status,
+                    skip_push=skip_push,
+                )
+            if (
+                next_session is not None
+                and next_session.state == "playing"
+                and not skip_push
+            ):
+                await self._ensure_achievement_poll(
+                    next_session,
+                    player_name=player_name,
+                    game_name=current_game_name,
+                )
+            if events:
+                self._plugin._data_dirty = True
+            return next_session, events
 
-    def tick_due(self, now: int):
+    async def tick_due(self, now: int):
         due = [
             (key, session)
             for key, session in list(self._sessions().items())
@@ -79,19 +82,25 @@ class SessionService:
             and int(now) >= session.exit_deadline
         ]
         for (group_id, sid), session in due:
-            next_session, events = apply(
-                session,
-                {"steamid": sid, "group_id": group_id, "gameid": None},
-                int(now),
-                sid=sid,
-                group_id=group_id,
-            )
-            self._store(group_id, sid, next_session)
-            for event in events:
-                if event.kind == "closed":
-                    self._apply_closed(event, skip_push=False)
-            if events:
-                self._plugin._data_dirty = True
+            key = self._key(group_id, sid)
+            async with self._locks[key]:
+                # 双重检查：锁内再次确认会话状态未变
+                current = self._sessions().get(key)
+                if current is None or current.state != "confirming_exit":
+                    continue
+                next_session, events = apply(
+                    current,
+                    {"steamid": sid, "group_id": group_id, "gameid": None},
+                    int(now),
+                    sid=sid,
+                    group_id=group_id,
+                )
+                self._store(group_id, sid, next_session)
+                for event in events:
+                    if event.kind == "closed":
+                        self._apply_closed(event, skip_push=False)
+                if events:
+                    self._plugin._data_dirty = True
 
     def discard_group(self, group_id):
         group_id = str(group_id)
