@@ -98,6 +98,62 @@ class PriceQueryService:
             logger.warning("价格卡查询超时 (game=%s, appid=%s)", game.id, game.appid)
             raise
 
+    async def _fetch_itad_summary(self, game: ITADGame, settings: PriceQuerySettings) -> dict:
+        if not game.id:
+            return {}
+        summary = await self._plugin.ITAD_CLIENT.get_price_summary(game.id, settings.region) or {}
+        if summary.get("current_price") is None:
+            for fallback_region in store_region_candidates(settings.region)[1:]:
+                fallback_summary = await self._plugin.ITAD_CLIENT.get_price_summary(
+                    game.id, fallback_region
+                ) or {}
+                if fallback_summary.get("current_price") is not None:
+                    logger.info(
+                        "ITAD %s 区无价格，改用 %s 区 (game=%s)",
+                        settings.region,
+                        fallback_region,
+                        game.id,
+                    )
+                    summary = fallback_summary
+                    break
+        return summary_to_currency(summary, settings.currency)
+
+    async def _fetch_region_prices(self, game: ITADGame, settings: PriceQuerySettings) -> dict:
+        if not game.appid:
+            return {}
+        region_codes = [settings.region]
+        if (
+            settings.compare_region
+            and settings.compare_region != "NONE"
+            and settings.compare_region != settings.region
+        ):
+            region_codes.append(settings.compare_region)
+        region_summaries = await asyncio.gather(
+            *[self._plugin.fetch_region_price(game.appid, code) for code in region_codes],
+            return_exceptions=True,
+        )
+        region_prices = {}
+        for code, region_summary in zip(region_codes, region_summaries):
+            if isinstance(region_summary, BaseException) or not region_summary:
+                continue
+            actual = str(region_summary.get("region") or code).upper()
+            region_prices[actual] = summary_to_currency(region_summary, settings.currency)
+        return region_prices
+
+    async def _fetch_store_details(self, game: ITADGame, settings: PriceQuerySettings):
+        if not game.appid:
+            return None
+        return await self._plugin.fetch_game_details(game.appid, country=settings.region)
+
+    async def _fetch_reviews(self, game: ITADGame, include_reviews: bool):
+        if not include_reviews or not game.appid:
+            return None
+        try:
+            return await self._plugin.fetch_game_reviews_both(game.appid)
+        except Exception as exc:
+            logger.warning("Steam 评价获取失败，继续生成价格卡 (appid=%s): %s", game.appid, exc)
+            return None
+
     async def _build_card_with_budget(
         self,
         game: ITADGame,
@@ -108,52 +164,20 @@ class PriceQueryService:
         if include_reviews is None:
             include_reviews = True
         settings = self._settings()
-        currency = settings.currency
-        region = settings.region
-        compare_region = settings.compare_region
-        summary = {}
-        if include_itad and game.id:
-            summary = await self._plugin.ITAD_CLIENT.get_price_summary(game.id, region) or {}
-            if summary.get("current_price") is None:
-                for fallback_region in store_region_candidates(region)[1:]:
-                    fallback_summary = await self._plugin.ITAD_CLIENT.get_price_summary(game.id, fallback_region) or {}
-                    if fallback_summary.get("current_price") is not None:
-                        logger.info(
-                            "ITAD %s 区无价格，改用 %s 区 (game=%s)",
-                            region,
-                            fallback_region,
-                            game.id,
-                        )
-                        summary = fallback_summary
-                        break
-            summary = summary_to_currency(summary, currency)
-        region_codes = [region]
-        if include_itad and compare_region and compare_region != "NONE" and compare_region != region:
-            region_codes.append(compare_region)
-        region_prices = {}
-        if game.appid and include_itad:
-            region_summaries = await asyncio.gather(
-                *[self._plugin.fetch_region_price(game.appid, code) for code in region_codes]
-            )
-            for code, region_summary in zip(region_codes, region_summaries):
-                if not region_summary:
-                    continue
-                actual = str(region_summary.get("region") or code).upper()
-                region_prices[actual] = summary_to_currency(region_summary, currency)
-        detail = await self._plugin.fetch_game_details(game.appid, country=region) if game.appid else None
-        reviews = None
-        if include_reviews and game.appid:
-            reviews = await self._plugin.fetch_game_reviews_both(game.appid)
+        summary = await self._fetch_itad_summary(game, settings) if include_itad else {}
+        region_prices = await self._fetch_region_prices(game, settings) if include_itad else {}
+        detail = await self._fetch_store_details(game, settings)
+        reviews = await self._fetch_reviews(game, include_reviews)
         if detail:
             detail["review_all"] = (reviews or {}).get("all") or {}
             detail["review_schinese"] = (reviews or {}).get("schinese") or {}
         store_appid = (detail or {}).get("store_appid") or game.appid
         store_url = f"https://store.steampowered.com/app/{store_appid}/" if store_appid else ""
         actual_store_region = str((detail or {}).get("_store_region") or "").upper()
-        locked = bool(store_url and is_store_region_locked(region, actual_store_region, region_prices))
+        locked = bool(store_url and is_store_region_locked(settings.region, actual_store_region, region_prices))
         store_message = store_url
         if locked and store_url:
-            region_label = COUNTRY_LABEL.get(region, region)
+            region_label = COUNTRY_LABEL.get(settings.region, settings.region)
             store_message = f"{store_url}\n当前游戏锁{region_label}"
         card_data = detail or {
             "name": game.title,
