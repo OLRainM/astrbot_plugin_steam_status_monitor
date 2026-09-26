@@ -480,12 +480,14 @@ class ITADClient:
         if current_price is None and fallback_deal is not None:
             current_price, current_regular, currency, cut = fallback_deal
         history_low = None
+        history_low_currency = None
         low_obj = current.get("historyLow") if isinstance(current, dict) else None
         if isinstance(low_obj, dict):
             low_all = low_obj.get("all") or {}
             history_low = self._price_amount(low_all)
+            history_low_currency = str(low_all.get("currency") or "").upper() or None
             if not currency:
-                currency = low_all.get("currency")
+                currency = history_low_currency
         return {
             "current": current,
             "current_price": current_price,
@@ -497,9 +499,12 @@ class ITADClient:
             "cdk_currency": cdk_currency,
             "cdk_cut": cdk_cut,
             "history_low": history_low,
+            "history_low_currency": history_low_currency,
             "lowest": history_low,
+            "lowest_currency": history_low_currency,
             "lowest_cut": None,
             "steam_low": steam_low,
+            "steam_low_currency": currency if steam_low is not None else None,
             "steam_low_cut": steam_low_cut,
             "history": [],
         }

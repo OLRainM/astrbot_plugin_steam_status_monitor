@@ -10,7 +10,6 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from ...shared.fonts import load_truetype
 from ...shared.network import httpx_client_kwargs
-from ...shared.utils.price import convert
 
 
 CARD_WIDTH = 820
@@ -324,7 +323,7 @@ async def render_game_detail_image(
     if cdk_shop and cdk_amount is not None:
         cdk_currency = itad_summary.get("cdk_currency")
         cdk_cut = itad_summary.get("cdk_cut")
-        target_price = convert(cdk_amount, cdk_currency, currency) if cdk_currency and cdk_currency != currency else cdk_amount
+        target_price = cdk_amount
         cdk_y = section_top[1] + 124
         price_part = _value_text(target_price, currency)
         draw.text((left_x + 12, cdk_y), "其它", font=small_font, fill=STEAM_MUTED)
