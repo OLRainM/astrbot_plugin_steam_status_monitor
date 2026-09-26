@@ -127,6 +127,7 @@ class SteamStatusMonitorV3(
             self,
             translator=lambda query: store.translate_game_query(self, query),
         )
+        self._itad_http_client_task = asyncio.create_task(self.ITAD_CLIENT.initialize_http_client())
         self.monitor_control = MonitorControlService(self)
         self.monitor_admin = MonitorAdminService(self)
         self.player_status_view = PlayerStatusViewService(self)
@@ -156,6 +157,7 @@ class SteamStatusMonitorV3(
             getattr(self, '_init_poll_task', None),
             getattr(self, '_font_pack_task', None),
             getattr(self, '_achievement_blacklist_verify_task', None),
+            getattr(self, '_itad_http_client_task', None),
         ):
             if t and not t.done():
                 t.cancel()
@@ -163,6 +165,9 @@ class SteamStatusMonitorV3(
         font_pack = getattr(self, 'font_pack', None)
         if font_pack:
             await font_pack.aclose()
+        itad_client = getattr(self, 'ITAD_CLIENT', None)
+        if itad_client is not None:
+            await itad_client.close_http_client()
         if hasattr(self, 'achievement_poll_tasks'):
             for task in self.achievement_poll_tasks.values():
                 if task and not task.done():

@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from html import unescape
 from typing import Any, Optional
+import asyncio
 import re
 import unicodedata
 
@@ -50,6 +51,43 @@ class ITADClient:
         self.api_key = (api_key or "").strip()
         self.proxy = proxy
         self.base_url = (base_url or self.BASE_URL).rstrip("/")
+        self._http_client = None
+        self._http_client_loop = None
+
+    async def initialize_http_client(self):
+        """在当前事件循环创建可复用的 ITAD 连接池。"""
+        loop = asyncio.get_running_loop()
+        if self._http_client is not None and self._http_client_loop is loop:
+            return self._http_client
+        await self.close_http_client()
+        self._http_client = httpx.AsyncClient(
+            timeout=20,
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            **httpx_client_kwargs(self.proxy),
+        )
+        self._http_client_loop = loop
+        return self._http_client
+
+    async def close_http_client(self):
+        client = self._http_client
+        self._http_client = None
+        self._http_client_loop = None
+        if client is not None:
+            await client.aclose()
+
+    async def _request_client(self):
+        if self._http_client is not None:
+            try:
+                if self._http_client_loop is asyncio.get_running_loop():
+                    return self._http_client, False
+            except RuntimeError:
+                pass
+        return httpx.AsyncClient(
+            timeout=20,
+            follow_redirects=True,
+            **httpx_client_kwargs(self.proxy),
+        ), True
 
     @staticmethod
     def _provider_error(exc, path):
@@ -71,30 +109,36 @@ class ITADClient:
             logger.warning("ITAD 未配置 API Key，跳过请求 %s", path)
             return None
         params = {**params, "key": self.api_key}
+        client, owned = await self._request_client()
         try:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True, **httpx_client_kwargs(self.proxy)) as client:
-                response = await client.get(f"{self.base_url}{path}", params=params)
-                response.raise_for_status()
-                return response.json()
+            response = await client.get(f"{self.base_url}{path}", params=params)
+            response.raise_for_status()
+            return response.json()
         except Exception as exc:
             error = self._provider_error(exc, path)
             logger.warning("ITAD 请求失败 %s [%s]: %s", path, error.code, exc)
             return None
+        finally:
+            if owned:
+                await client.aclose()
 
     async def _post(self, path: str, body, params: dict[str, Any]):
         if not self.api_key:
             logger.warning("ITAD 未配置 API Key，跳过请求 %s", path)
             return None
         params = {**params, "key": self.api_key}
+        client, owned = await self._request_client()
         try:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True, **httpx_client_kwargs(self.proxy)) as client:
-                response = await client.post(f"{self.base_url}{path}", json=body, params=params)
-                response.raise_for_status()
-                return response.json()
+            response = await client.post(f"{self.base_url}{path}", json=body, params=params)
+            response.raise_for_status()
+            return response.json()
         except Exception as exc:
             error = self._provider_error(exc, path)
             logger.warning("ITAD 请求失败 %s [%s]: %s", path, error.code, exc)
             return None
+        finally:
+            if owned:
+                await client.aclose()
 
     async def _parse_search_payload(self, payload, limit: int = 6) -> list[ITADGame]:
         if not isinstance(payload, list):
