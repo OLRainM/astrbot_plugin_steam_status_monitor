@@ -133,7 +133,19 @@ async def price(plugin, event, auto_first: bool, prefix: str):
             lines.append(f"{index}. {item.title}")
         yield event.plain_result("\n".join(lines))
         return
-    card = await plugin.price_query.build_card(game_item)
+    try:
+        card = await plugin.price_query.build_card(game_item)
+    except TimeoutError:
+        plugin._steam_search_pending.pop(session_key, None)
+        plugin._steam_search_cache.pop(session_key, None)
+        yield event.plain_result("价格查询超时，请稍后重试。")
+        return
+    except Exception:
+        logger.exception("构建 Steam 价格卡失败 (query=%s)", query)
+        plugin._steam_search_pending.pop(session_key, None)
+        plugin._steam_search_cache.pop(session_key, None)
+        yield event.plain_result("价格服务暂时不可用，请稍后重试。")
+        return
     plugin._steam_search_pending.pop(session_key, None)
     plugin._steam_search_cache.pop(session_key, None)
     try:

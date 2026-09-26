@@ -76,6 +76,24 @@ class PriceQueryService:
         include_itad: bool = True,
         include_reviews: Optional[bool] = None,
     ) -> PriceCard:
+        try:
+            async with asyncio.timeout(20):
+                return await self._build_card_with_budget(
+                    game,
+                    include_itad=include_itad,
+                    include_reviews=include_reviews,
+                )
+        except TimeoutError:
+            logger.warning("价格卡查询超时 (game=%s, appid=%s)", game.id, game.appid)
+            raise
+
+    async def _build_card_with_budget(
+        self,
+        game: ITADGame,
+        *,
+        include_itad: bool,
+        include_reviews: Optional[bool],
+    ) -> PriceCard:
         if include_reviews is None:
             include_reviews = True
         currency, region, compare_region = self._settings()

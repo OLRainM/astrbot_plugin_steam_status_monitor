@@ -13,6 +13,15 @@ except ImportError:
     import logging
     logger = logging.getLogger(__name__)
 try:
+    from ...infrastructure.clients.errors import ProviderError
+except ImportError:
+    class ProviderError(RuntimeError):
+        def __init__(self, code, message="", *, status_code=None, retryable=False):
+            self.code = code
+            self.status_code = status_code
+            self.retryable = retryable
+            super().__init__(message or code)
+try:
     from ...shared.network import httpx_client_kwargs
 except ImportError:
     def httpx_client_kwargs(proxy=None):
@@ -42,8 +51,24 @@ class ITADClient:
         self.proxy = proxy
         self.base_url = (base_url or self.BASE_URL).rstrip("/")
 
+    @staticmethod
+    def _provider_error(exc, path):
+        if isinstance(exc, httpx.TimeoutException):
+            return ProviderError("TIMEOUT", f"ITAD 请求超时: {path}", retryable=True)
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+            if status == 401 or status == 403:
+                return ProviderError("AUTH_ERROR", f"ITAD 鉴权失败: {path}", status_code=status)
+            if status == 429:
+                return ProviderError("RATE_LIMITED", f"ITAD 请求受限: {path}", status_code=status, retryable=True)
+            return ProviderError("UPSTREAM_ERROR", f"ITAD 上游失败: {path}", status_code=status, retryable=status >= 500)
+        if isinstance(exc, ValueError):
+            return ProviderError("INVALID_RESPONSE", f"ITAD 响应解析失败: {path}")
+        return ProviderError("UPSTREAM_ERROR", f"ITAD 请求失败: {path}", retryable=True)
+
     async def _get(self, path: str, params: dict[str, Any]):
         if not self.api_key:
+            logger.warning("ITAD 未配置 API Key，跳过请求 %s", path)
             return None
         params = {**params, "key": self.api_key}
         try:
@@ -52,11 +77,13 @@ class ITADClient:
                 response.raise_for_status()
                 return response.json()
         except Exception as exc:
-            logger.warning("ITAD 请求失败 %s: %s", path, exc)
+            error = self._provider_error(exc, path)
+            logger.warning("ITAD 请求失败 %s [%s]: %s", path, error.code, exc)
             return None
 
     async def _post(self, path: str, body, params: dict[str, Any]):
         if not self.api_key:
+            logger.warning("ITAD 未配置 API Key，跳过请求 %s", path)
             return None
         params = {**params, "key": self.api_key}
         try:
@@ -65,7 +92,8 @@ class ITADClient:
                 response.raise_for_status()
                 return response.json()
         except Exception as exc:
-            logger.warning("ITAD 请求失败 %s: %s", path, exc)
+            error = self._provider_error(exc, path)
+            logger.warning("ITAD 请求失败 %s [%s]: %s", path, error.code, exc)
             return None
 
     async def _parse_search_payload(self, payload, limit: int = 6) -> list[ITADGame]:
