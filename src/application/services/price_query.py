@@ -21,6 +21,13 @@ def contains_chinese(text: str) -> bool:
     return any("\u4e00" <= char <= "\u9fff" for char in text)
 
 
+@dataclass(frozen=True)
+class PriceQuerySettings:
+    currency: str
+    region: str
+    compare_region: str
+
+
 @dataclass
 class PriceCard:
     game: Optional[ITADGame]
@@ -41,7 +48,7 @@ class PriceQueryService:
         self._plugin = plugin
         self._translator = translator
 
-    def _settings(self):
+    def _settings(self) -> PriceQuerySettings:
         config = getattr(self._plugin, "config", {}) or {}
         currency = (config.get("price_currency", "CNY") or "CNY").strip().upper() or "CNY"
         region = (config.get("price_region", "") or "").strip().upper()
@@ -49,7 +56,11 @@ class PriceQueryService:
             region = CURRENCY_REGION.get(currency, "CN")
         compare_raw = (config.get("price_compare_regions", "UA") or "NONE").strip()
         compare_region = compare_raw.split(",")[0].strip().upper()
-        return currency, region, compare_region
+        return PriceQuerySettings(
+            currency=currency,
+            region=region,
+            compare_region=compare_region,
+        )
 
     async def resolve_games(self, query: str) -> List[ITADGame]:
         query = str(query or "").strip()
@@ -96,7 +107,10 @@ class PriceQueryService:
     ) -> PriceCard:
         if include_reviews is None:
             include_reviews = True
-        currency, region, compare_region = self._settings()
+        settings = self._settings()
+        currency = settings.currency
+        region = settings.region
+        compare_region = settings.compare_region
         summary = {}
         if include_itad and game.id:
             summary = await self._plugin.ITAD_CLIENT.get_price_summary(game.id, region) or {}

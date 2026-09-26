@@ -18,6 +18,15 @@ class PriceQueryServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         return PriceQueryService(plugin), plugin
 
+    async def test_settings_returns_typed_named_values(self):
+        service, _ = self._service()
+
+        settings = service._settings()
+
+        self.assertEqual("CNY", settings.currency)
+        self.assertEqual("CN", settings.region)
+        self.assertEqual("NONE", settings.compare_region)
+
     async def test_resolve_games_uses_store_url_lookup(self):
         game = ITADGame(id="itad1", title="Elden Ring", appid="1245620")
         service, plugin = self._service(
